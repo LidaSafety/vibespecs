@@ -442,7 +442,7 @@ def draft_spec(
     category: str = "drafted",
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 1500,
+    max_tokens: int = 4096,
     timeout_seconds: float = 60.0,
     additional_sources: dict[str, str] | None = None,
     override_positive_test: "PositiveTest | None" = None,
@@ -567,7 +567,7 @@ def refine_draft(
     category: str = "drafted",
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 1500,
+    max_tokens: int = 4096,
     timeout_seconds: float = 60.0,
 ) -> DraftSpec:
     """Re-draft a spec given reviewer objections to the previous draft.
@@ -735,7 +735,7 @@ def compare_drafts(
     models: tuple[str, ...] = DEFAULT_COMPARE_MODELS,
     task_id: str = "draft",
     api_key: str | None = None,
-    max_tokens: int = 1500,
+    max_tokens: int = 4096,
     timeout_seconds: float = 60.0,
 ) -> DraftComparison:
     """Draft specs from multiple models and report agreement / disagreement.
