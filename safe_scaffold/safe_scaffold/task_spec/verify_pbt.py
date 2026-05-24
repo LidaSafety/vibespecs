@@ -280,10 +280,19 @@ def verify_against_oracle(
         )
 
     # Hypothesis-shrunken counterexample tends to appear after a
-    # `Falsifying example:` line. Capture from there to the end (clipped).
-    ce_match = re.search(r"Falsifying example:.*?(?=\n_+\s*$|\Z)",
-                          combined, flags=re.DOTALL)
+    # `Falsifying example:` line. Capture from there until pytest's next
+    # separator (a line of `=`, `_`, or `-`) — without this bound we also
+    # slurp the whole `=== Hypothesis Statistics ===` block, which is noise.
+    ce_match = re.search(
+        r"Falsifying example:.*?(?=\n[=_\-]{5,}|\Z)",
+        combined, flags=re.DOTALL,
+    )
     counterexample = ce_match.group(0).strip() if ce_match else ""
+    # Strip pytest's `E   ` exception-marker prefix that prefixes each line.
+    if counterexample:
+        counterexample = "\n".join(
+            re.sub(r"^E\s{0,4}", "", line) for line in counterexample.splitlines()
+        )
     if not counterexample:
         # Fall back to the last few non-empty lines so the user has something.
         lines = [l for l in combined.splitlines() if l.strip()]

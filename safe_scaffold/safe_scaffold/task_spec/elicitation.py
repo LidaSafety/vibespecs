@@ -468,17 +468,16 @@ def draft_spec(
     if not text:
         return DraftSpec(spec=None, raw_response=text, error="empty response")
 
-    # The system prompt forbids markdown fences but models sometimes add
-    # them anyway. Strip a single ```json ... ``` wrapper if present.
-    cleaned = text
-    m = re.match(r"^```(?:json)?\s*(.+?)\s*```$", cleaned, flags=re.DOTALL)
-    if m:
-        cleaned = m.group(1)
-
-    try:
-        payload = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        return DraftSpec(spec=None, raw_response=text, error=f"JSON parse: {exc}")
+    # Models sometimes wrap JSON in fences, <answer> tags, or trailing prose;
+    # use the codegen extractor which handles all of those.
+    from safe_scaffold.task_spec.codegen import _extract_json_object
+    payload = _extract_json_object(text)
+    if payload is None:
+        snippet = (text or "").strip()[:300].replace("\n", "\\n")
+        return DraftSpec(
+            spec=None, raw_response=text,
+            error=f"JSON parse: no JSON object found in LLM response (first 300 chars: {snippet!r})",
+        )
 
     err = _validate_payload(payload)
     if err:
@@ -629,15 +628,14 @@ def refine_draft(
         b.get("text", "") for b in payload.get("content", [])
         if isinstance(b, dict) and b.get("type") == "text"
     ).strip()
-    cleaned = text
-    m = re.match(r"^```(?:json)?\s*(.+?)\s*```$", cleaned, flags=re.DOTALL)
-    if m:
-        cleaned = m.group(1)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        return DraftSpec(spec=None, raw_response=text,
-                         error=f"JSON parse: {exc}")
+    from safe_scaffold.task_spec.codegen import _extract_json_object
+    parsed = _extract_json_object(text)
+    if parsed is None:
+        snippet = (text or "").strip()[:300].replace("\n", "\\n")
+        return DraftSpec(
+            spec=None, raw_response=text,
+            error=f"JSON parse: no JSON object found in LLM response (first 300 chars: {snippet!r})",
+        )
     err = _validate_payload(parsed)
     if err:
         return DraftSpec(spec=None, raw_response=text,

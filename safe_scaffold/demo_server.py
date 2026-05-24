@@ -192,7 +192,9 @@ def elicit(req: ElicitRequest) -> dict[str, Any]:
     if not req.description.strip():
         raise HTTPException(400, "description must not be empty")
     if not req.starting_repo:
-        raise HTTPException(400, "starting_repo must not be empty")
+        # Reasonable default for "start from scratch" briefs: empty main.py.
+        # Lets the iterative tab elicit without first hand-adding a file.
+        req.starting_repo = {"main.py": ""}
 
     draft = draft_spec(
         req.description,
@@ -569,6 +571,15 @@ def api_pbt_only(req: PBTOnlyRequest) -> dict[str, Any]:
         return {
             "outcome": "error",
             "detail": "spec has no behavioral_spec; cannot run PBT",
+            "counterexample": "",
+            "duration_seconds": 0.0,
+            "n_runs": 0,
+        }
+    if not (spec.behavioral_spec.python_oracle or "").strip():
+        return {
+            "outcome": "error",
+            "detail": ("no reference oracle provided — PBT cannot run without "
+                       "a comparator. Provide one in Section 5 or skip PBT."),
             "counterexample": "",
             "duration_seconds": 0.0,
             "n_runs": 0,
@@ -1096,12 +1107,17 @@ INDEX_HTML = r"""<!doctype html>
     <summary><strong>Section 5 · Property-Based Testing</strong> — Hypothesis vs the reference oracle (200 examples)</summary>
     <div class="iter-body">
       <div class="muted" style="font-size:12px;margin-bottom:6px">
-        Available only when Section 1 produced a <code>behavioral_spec</code> with a
-        Python reference oracle. Runs the agent's current code against the
-        oracle on 200 Hypothesis-drawn inputs from the spec's input strategy.
+        Edit the reference oracle below — a slow-but-obviously-correct Python
+        implementation the PBT run will fuzz the agent's code against. If
+        Section 1 elicitation auto-synthesized one, treat it skeptically and
+        either rewrite it or click "Clear" to skip PBT.
       </div>
+      <div id="iter-oracle-warn" class="muted" style="font-size:12px;margin-bottom:6px"></div>
+      <label class="iter-label">Reference oracle (Python)</label>
+      <textarea id="iter-oracle" class="iter-code" rows="10" placeholder="def oracle(x): ..."></textarea>
       <div class="iter-actions">
         <button id="iter-pbt-btn" class="primary">Run PBT vs oracle →</button>
+        <button id="iter-oracle-clear-btn">Clear oracle (skip PBT)</button>
         <span id="iter-pbt-status" class="iter-status"></span>
       </div>
       <div id="iter-pbt-result"></div>
@@ -2726,7 +2742,7 @@ pipelineLoadBriefs();
 const IT_STATE = {
   brief_id: null,
   intent: '',
-  starting_repo: {},      // {path: code}
+  starting_repo: {'main.py': ''},  // {path: code}; seeded to match IT_FILES
   ground_truth_spec: '',
   ground_truth_code: '',
   drafted: null,          // /api/elicit response
@@ -2739,7 +2755,10 @@ const IT_STATE = {
   test_results: null,     // [{input, expected, got, status, error?}]
   pbt: null,              // {outcome, detail, counterexample, ...}
 };
-let IT_FILES = [];        // {path, code}[] — UI rows for starting_repo
+// Seed the file editor with an empty main.py so "start blank" users have
+// an obvious place to write code without first clicking + add file.
+const IT_BLANK_FILES = () => [{path: 'main.py', code: ''}];
+let IT_FILES = IT_BLANK_FILES();   // {path, code}[] — UI rows for starting_repo
 
 function _itRenderFiles() {
   const host = document.getElementById('iter-files');
@@ -2802,6 +2821,16 @@ function _setStatus(elId, text, cls) {
       sel.appendChild(opt);
     }
     sel.addEventListener('change', () => {
+      if (!sel.value) {
+        // "— start blank —": reset to default empty main.py seed.
+        IT_STATE.brief_id = '';
+        IT_STATE.intent = '';
+        document.getElementById('iter-intent').value = '';
+        IT_FILES = IT_BLANK_FILES();
+        IT_STATE.starting_repo = Object.fromEntries(IT_FILES.map(f => [f.path, f.code]));
+        _itRenderFiles();
+        return;
+      }
       const b = r.briefs.find(x => x.brief_id === sel.value);
       if (!b) return;
       IT_STATE.brief_id = b.brief_id;
@@ -2828,9 +2857,8 @@ function _setStatus(elId, text, cls) {
 // ----- Section 1: Elicit
 document.getElementById('iter-elicit-btn').addEventListener('click', async () => {
   if (!IT_STATE.intent.trim()) { alert('intent is empty'); return; }
-  if (!Object.keys(IT_STATE.starting_repo).length) {
-    alert('add at least one starting file'); return;
-  }
+  // No file-count guard: the backend defaults to {"main.py": ""} when the
+  // starting_repo is empty, so a free-text English brief can elicit directly.
   _setStatus('iter-elicit-status', 'eliciting…', 'running');
   try {
     const r = await fetchJSON('/api/elicit', {
@@ -2846,6 +2874,9 @@ document.getElementById('iter-elicit-btn').addEventListener('click', async () =>
     _setStatus('iter-elicit-status', r.ok ? 'spec drafted ✓' : 'failed',
                 r.ok ? 'ok' : 'err');
     document.getElementById('iter-elicit-result').innerHTML = _itRenderElicitResult(r);
+    // Section 5: surface the LLM-synthesized oracle as editable text so the
+    // user can review / replace / clear it before running PBT.
+    _itRefreshOracleUI();
     // Pre-populate Section 2's Lean source by emitting from the spec.
     if (r.ok) {
       const leanResp = await fetchJSON('/api/emit_lean', {
@@ -2863,13 +2894,15 @@ document.getElementById('iter-elicit-btn').addEventListener('click', async () =>
 function _itSpecJson() {
   const r = IT_STATE.drafted;
   if (!r || !r.spec) return null;
+  // Use the *mutable* behavioral_spec from IT_STATE so user edits (oracle
+  // in Section 5, etc.) flow through to codegen / test-cases / PBT.
   return {
     task_id: r.spec.task_id,
     description: r.spec.description,
     starting_repo: r.spec.starting_repo,
     invariants: r.drafted_invariants,
     positive_tests: r.spec.positive_tests,
-    behavioral_spec: r.behavioral_spec,
+    behavioral_spec: IT_STATE.behavioral_spec,
   };
 }
 
@@ -3086,11 +3119,49 @@ document.getElementById('iter-cases-run-btn').addEventListener('click', async ()
   }
 });
 
-// ----- Section 5: PBT
+// ----- Section 5: PBT (with editable oracle)
+function _itRefreshOracleUI() {
+  const bs = IT_STATE.behavioral_spec;
+  const oracleText = (bs && bs.python_oracle) || '';
+  document.getElementById('iter-oracle').value = oracleText;
+  const warn = document.getElementById('iter-oracle-warn');
+  if (!bs) {
+    warn.innerHTML = '<span style="color:var(--yellow)">⚠ Section 1 produced no behavioral_spec — paste a reference oracle here to enable PBT.</span>';
+  } else if (!oracleText.trim()) {
+    warn.innerHTML = '<span style="color:var(--yellow)">⚠ no reference oracle — PBT button is disabled.</span>';
+  } else {
+    warn.innerHTML = '<span style="color:var(--yellow)">⚠ oracle was LLM-synthesized by Section 1 — review (or rewrite) before trusting PBT verdicts.</span>';
+  }
+  _itRefreshPbtBtn();
+}
+
+function _itRefreshPbtBtn() {
+  const btn = document.getElementById('iter-pbt-btn');
+  const has = (document.getElementById('iter-oracle').value || '').trim();
+  btn.disabled = !has;
+  btn.title = has ? '' : 'oracle is empty — paste a Python comparator above to enable';
+}
+
+document.getElementById('iter-oracle').addEventListener('input', e => {
+  if (!IT_STATE.behavioral_spec) IT_STATE.behavioral_spec = {};
+  IT_STATE.behavioral_spec.python_oracle = e.target.value;
+  _itRefreshPbtBtn();
+});
+_itRefreshPbtBtn();  // start disabled until Section 1 runs (or user pastes)
+
+document.getElementById('iter-oracle-clear-btn').addEventListener('click', () => {
+  document.getElementById('iter-oracle').value = '';
+  if (IT_STATE.behavioral_spec) IT_STATE.behavioral_spec.python_oracle = '';
+  _itRefreshOracleUI();
+  document.getElementById('iter-pbt-result').innerHTML = '';
+  _setStatus('iter-pbt-status', 'oracle cleared — PBT disabled', 'muted');
+});
+
 document.getElementById('iter-pbt-btn').addEventListener('click', async () => {
   if (!IT_STATE.drafted) { alert('run Section 1 first'); return; }
-  if (!IT_STATE.behavioral_spec) {
-    alert('no behavioral_spec; PBT requires a reference oracle');
+  const oracle = (document.getElementById('iter-oracle').value || '').trim();
+  if (!oracle) {
+    alert('no reference oracle — paste one above or click Clear to skip PBT');
     return;
   }
   if (!Object.keys(IT_STATE.code_repo).length) { alert('no code to fuzz'); return; }
