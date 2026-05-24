@@ -208,12 +208,23 @@ def elicit(req: ElicitRequest) -> dict[str, Any]:
         }
         for d in draft.drafted_invariants
     ]
+    bs = draft.spec.behavioral_spec if draft.spec else None
+    behavioral_out = None
+    if bs is not None:
+        behavioral_out = {
+            "function_name":  bs.function_name,
+            "signature":      bs.signature,
+            "lean_predicate": bs.lean_predicate,
+            "python_oracle":  bs.python_oracle,
+            "input_strategy": bs.input_strategy,
+        }
     return {
         "ok": draft.ok,
         "error": draft.error,
         "raw_response": draft.raw_response,
         "spec": _task_full(draft.spec, ()) if draft.spec else None,
         "drafted_invariants": invariants_out,
+        "behavioral_spec": behavioral_out,
         "positive_test_rationale": draft.positive_test_rationale,
         "contradictions": [
             {"sources": list(c.sources),
@@ -274,8 +285,11 @@ def _spec_from_request(req: "EmitLeanRequest"):
         return entry[0]
     if req.spec_json is not None:
         # Minimal reconstruction: we only need the fields emit_lean reads
-        # (task_id, description, negative_invariants, positive_tests).
-        from safe_scaffold.task_spec.spec import TaskSpec, PositiveTest
+        # (task_id, description, negative_invariants, positive_tests) plus,
+        # if present, the behavioral_spec so codegen can run PBT.
+        from safe_scaffold.task_spec.spec import (
+            BehavioralSpec, PositiveTest, TaskSpec,
+        )
         from safe_scaffold.task_spec.invariants import (
             DiffSmallerThan, FilesUnchanged, NoNewImports,
             NoSecretsInDiff, OnlyFilesModified, PositiveTestPasses,
@@ -305,12 +319,23 @@ def _spec_from_request(req: "EmitLeanRequest"):
                           name=pt.get("name", ""))
             for pt in req.spec_json.get("positive_tests", [])
         )
+        bs_dict = req.spec_json.get("behavioral_spec")
+        behavioral = None
+        if isinstance(bs_dict, dict) and bs_dict.get("function_name"):
+            behavioral = BehavioralSpec(
+                function_name=bs_dict.get("function_name", ""),
+                signature=bs_dict.get("signature", ""),
+                lean_predicate=bs_dict.get("lean_predicate", ""),
+                python_oracle=bs_dict.get("python_oracle", ""),
+                input_strategy=bs_dict.get("input_strategy", "integers()"),
+            )
         return TaskSpec(
             task_id=req.spec_json.get("task_id", "draft"),
             description=req.spec_json.get("description", ""),
             starting_repo=req.spec_json.get("starting_repo", {}),
             positive_tests=tests,
             negative_invariants=tuple(invs),
+            behavioral_spec=behavioral,
         )
     raise HTTPException(400, "provide task_id or spec_json")
 
@@ -395,11 +420,20 @@ class CodegenRequest(BaseModel):
 
 @app.post("/api/codegen")
 def api_codegen(req: CodegenRequest) -> dict[str, Any]:
-    """Step 4 of the pipeline: spec → Python implementation."""
+    """Step 4 of the pipeline: spec → Python implementation → structural + PBT verification."""
     # Reuse the same JSON→TaskSpec reconstruction as /api/emit_lean.
     fake = EmitLeanRequest(spec_json=req.spec_json)
     spec = _spec_from_request(fake)
     result = generate_code(spec)
+    pbt = None
+    if result.pbt_result is not None:
+        pbt = {
+            "outcome": result.pbt_result.outcome,
+            "detail": result.pbt_result.detail,
+            "counterexample": result.pbt_result.counterexample,
+            "duration_seconds": round(result.pbt_result.duration_seconds, 3),
+            "n_runs": result.pbt_result.n_runs,
+        }
     return {
         "ok": result.ok,
         "error": result.error,
@@ -416,6 +450,7 @@ def api_codegen(req: CodegenRequest) -> dict[str, Any]:
                 for r in (result.verdict.invariant_results if result.verdict else ())
             ],
         },
+        "pbt_result": pbt,
     }
 
 
@@ -1176,6 +1211,13 @@ function renderElicitResult(r) {
       </div>`
     : '';
 
+  // Behavioral spec block (the algorithmic content of the intent). The
+  // pipeline view has its own renderer (renderBehavioralBlock) — reuse it
+  // here when available, otherwise show a minimal fallback.
+  const behavioralHtml = (typeof renderBehavioralBlock === 'function')
+    ? renderBehavioralBlock(r.behavioral_spec)
+    : '';
+
   document.getElementById('elicit-result').innerHTML = `
     ${renderIterationTimeline()}
     ${contradictionsHtml}
@@ -1183,6 +1225,7 @@ function renderElicitResult(r) {
       <div class="label">proposed invariants (with rationale) — click ✗ to flag for revision</div>
       ${invHtml}
     </div>
+    ${behavioralHtml}
     <div id="draft-lean-panel"></div>
     <div class="section">
       <div class="label">proposed positive test — ${escapeHtml(pt.path||'')}
@@ -1224,6 +1267,7 @@ async function emitLeanFromDraft(r) {
       starting_repo: r.spec.starting_repo,
       invariants: r.drafted_invariants,
       positive_tests: r.spec.positive_tests,
+      behavioral_spec: r.behavioral_spec || null,
     };
     const lean = await fetchJSON('/api/emit_lean', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1770,12 +1814,12 @@ const PIPELINE_STEPS = [
   {key: 'step2', n: 2, title: 'Step 2 · Lean output',
    tabLabel: 'Lean',
    sub: 'emit the drafted spec as real Lean 4 source; type-check with `lake build`; toggle between spec.lean and the EARS controlled-NL view'},
-  {key: 'step3', n: 3, title: 'Step 3 · Validate spec with tools',
-   tabLabel: 'Validate',
-   sub: 'cross-check the spec by drafting it again with a different model; surface every field the two models disagree on'},
-  {key: 'step4', n: 4, title: 'Step 4 · Create Python code',
+  {key: 'step3', n: 3, title: 'Step 3 · Create Python code',
    tabLabel: 'Code',
-   sub: 'ask the LLM to implement the spec; StructuredValidator confirms ACCEPT (or names the specific invariant that tripped)'},
+   sub: 'ask the LLM to implement the spec; this step only generates and shows the code — validation comes next'},
+  {key: 'step4', n: 4, title: 'Step 4 · Validate the implementation',
+   tabLabel: 'Validate',
+   sub: 'check the generated code against the spec: structural invariants (file scope, imports, diff size, secrets, positive test) + Property-Based Testing (PBT) against the LLM-emitted reference oracle'},
 ];
 
 let ACTIVE_STEP_IDX = 0;
@@ -1881,10 +1925,10 @@ function renderStepIntro(step) {
     return '<div class="muted">run step 1 first, or click "Run step 2" to use cached spec</div>';
   }
   if (step.key === 'step3') {
-    return '<div class="muted">cross-checks the drafted spec by asking a different model to draft the same thing; flags any disagreements</div>';
+    return '<div class="muted">asks the LLM to implement the drafted spec; shows the generated code (validation is in Step 4)</div>';
   }
   if (step.key === 'step4') {
-    return '<div class="muted">asks the LLM to implement the drafted spec; StructuredValidator confirms ACCEPT</div>';
+    return '<div class="muted">checks the generated code against the spec: structural invariants + Property-Based Testing (PBT) against the LLM-emitted reference oracle; reads the codegen result from Step 3 (no extra API call)</div>';
   }
   return '';
 }
@@ -1901,47 +1945,103 @@ function renderStepBody(step, state) {
   if (step.key === 'step2') {
     return renderStep2Body(state.result);
   }
+  // Step 3 = code generation only. We DO have the validator + PBT
+  // results in r.verdict and r.pbt_result (because /api/codegen runs
+  // them inline), but we intentionally do NOT show them here — Step 4
+  // is where the validation is presented. Step 3 just shows the
+  // generated files so the reviewer can read what the LLM produced
+  // BEFORE seeing the verdict.
   if (step.key === 'step3') {
     const r = state.result;
-    const dis = r.disagreements || [];
-    const banner = dis.length
-      ? `<div class="verdict-box abstain"><strong>⚠ ${dis.length} field${dis.length===1?'':'s'} where models disagreed:</strong>
-          ${dis.map(d => `<span class="pill abstain" style="margin:0 4px">${escapeHtml(d)}</span>`).join('')}
-         </div>`
-      : `<div class="verdict-box accept"><strong>✓ All models agreed.</strong> Spec is uncontested across models for this intent.</div>`;
-    const rows = r.field_comparisons.map(c => {
-      const cls = c.agreement === 'agree' ? 'accept'
-        : c.agreement === 'disagree' ? 'reject' : 'abstain';
-      const vals = r.models.map(m => {
-        const v = c.values_by_model[m];
-        return `<td><code>${v===undefined?'(failed)':escapeHtml(JSON.stringify(v))}</code></td>`;
-      }).join('');
-      return `<tr><td><strong>${escapeHtml(c.field_name)}</strong></td><td><span class="pill ${cls}">${c.agreement}</span></td>${vals}</tr>`;
+    const filesHtml = (r.files_changed || []).map(p => {
+      const code = r.modified_repo[p] || '';
+      return `<details style="margin-top:6px" open><summary><code>${escapeHtml(p)}</code></summary><pre>${escapeHtml(code)}</pre></details>`;
     }).join('');
-    return `${banner}<table class="mut" style="margin-top:8px"><tr><th>field</th><th>agreement</th>${r.models.map(m=>`<th>${escapeHtml(m)}</th>`).join('')}</tr>${rows}</table>`;
+    return `<div class="muted" style="font-size:12px;margin-bottom:8px">
+        Generated by the LLM from the elicited spec. Validation
+        (structural invariants + Property-Based Testing against the
+        reference oracle) is in Step 4.
+      </div>
+      <div><strong>files generated:</strong> ${(r.files_changed||[]).map(p=>`<code>${escapeHtml(p)}</code>`).join(', ') || '(none)'}</div>
+      ${r.notes ? `<div class="muted" style="font-size:12px;margin-top:4px">notes: ${escapeHtml(r.notes)}</div>` : ''}
+      ${filesHtml}`;
   }
+  // Step 4 = validation. Reads the same /api/codegen response Step 3
+  // already received (cached on PIPELINE_STATE.step3.result). Renders
+  // the structural per-invariant trace + the PBT-against-oracle row.
+  // No second API call.
   if (step.key === 'step4') {
     const r = state.result;
     const v = r.verdict || {};
-    const cls = v.decision === 'accept' ? 'accept' : v.decision === 'abstain' ? 'abstain' : 'reject';
-    const verdictMsg = v.decision
-      ? `<div class="verdict-box ${cls}"><strong>${v.decision.toUpperCase()}</strong> — ${escapeHtml(v.reason||'')}</div>`
-      : '';
+    // Compute the combined verdict: ACCEPT iff structural ACCEPT AND
+    // (PBT verified OR PBT skipped). r.ok already encodes this server-side.
+    const decision = r.ok ? 'accept'
+                    : (v.decision === 'abstain' ? 'abstain' : 'reject');
+    const cls = decision === 'accept' ? 'accept'
+              : decision === 'abstain' ? 'abstain' : 'reject';
+    // When the combined verdict is REJECT, prefer the failure that
+    // actually caused it. If the structural validator rejected
+    // (v.decision === 'reject' OR 'abstain'), use v.reason. Otherwise
+    // the structural side passed but PBT failed — use the PBT detail.
+    // The old logic always used v.reason if truthy, which produced the
+    // misleading "all invariants held" message on PBT-only failures.
+    const structuralRejected = v.decision === 'reject' || v.decision === 'abstain';
+    const reasonText = r.ok
+      ? 'all structural invariants held and behavioral spec verified by PBT'
+      : structuralRejected
+          ? (v.reason || 'see traces below')
+          : (r.pbt_result
+              ? `behavioral check failed — ${r.pbt_result.detail}`
+              : (v.reason || 'see traces below'));
+    const verdictMsg = `<div class="verdict-box ${cls}">
+      <strong>${decision.toUpperCase()}</strong> — ${escapeHtml(reasonText)}
+    </div>`;
     const traces = (v.invariant_results || []).map(ir => {
       const c = ir.uncertain ? 'uncertain' : (ir.holds ? 'pass' : 'fail');
       const m = ir.uncertain ? '⊘' : (ir.holds ? '✓' : '✗');
-      return `<div class="inv-trace ${c}"><span class="check">${m}</span><span><span class="inv-name">${ir.name}</span><span class="details"> — ${escapeHtml(ir.details||'')}</span></span></div>`;
+      return `<div class="inv-trace ${c}"><span class="check">${m}</span><span><span class="inv-name">${escapeHtml(ir.name)}</span><span class="details"> — ${escapeHtml(ir.details||'')}</span></span></div>`;
     }).join('');
-    const filesHtml = (r.files_changed || []).map(p => {
-      const code = r.modified_repo[p] || '';
-      return `<details style="margin-top:6px"><summary><code>${escapeHtml(p)}</code></summary><pre>${escapeHtml(code)}</pre></details>`;
-    }).join('');
+    let pbtTrace = '';
+    if (r.pbt_result) {
+      const p = r.pbt_result;
+      const pcls = p.outcome === 'verified' ? 'pass'
+                 : p.outcome === 'falsified' ? 'fail' : 'uncertain';
+      const pmark = p.outcome === 'verified' ? '✓'
+                  : p.outcome === 'falsified' ? '✗' : '⊘';
+      const dur = p.duration_seconds ? ` (${p.duration_seconds.toFixed(2)}s)` : '';
+      pbtTrace = `<div class="inv-trace ${pcls}">
+        <span class="check">${pmark}</span>
+        <span><span class="inv-name">BehavioralSpecHolds</span><span class="details"> — ${escapeHtml(p.detail || '')}${dur}</span></span>
+      </div>`;
+      if (p.counterexample) {
+        pbtTrace += `<details style="margin:4px 0 8px 24px" open><summary class="muted" style="cursor:pointer;font-size:11px">shrunken counterexample</summary><pre style="font-size:11px">${escapeHtml(p.counterexample)}</pre></details>`;
+      }
+    } else {
+      pbtTrace = `<div class="inv-trace uncertain">
+        <span class="check">⊘</span>
+        <span><span class="inv-name">BehavioralSpecHolds</span><span class="details"> — skipped (spec has no behavioral_spec — see Step 1)</span></span>
+      </div>`;
+    }
+    // Pull the LLM-emitted Python reference oracle from Step 1's
+    // elicitation result so the reviewer can see exactly what the PBT
+    // run compared the agent's code against. The oracle is part of the
+    // *test setup*, not part of the elicited spec contract, so it lives
+    // here in Step 4 rather than in Step 1.
+    const bs = PIPELINE_STATE.step1
+              && PIPELINE_STATE.step1.result
+              && PIPELINE_STATE.step1.result.behavioral_spec;
+    const oracleBlock = bs && bs.python_oracle
+      ? `<details style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
+          <summary style="cursor:pointer;font-size:12px"><strong>Python reference oracle</strong> — the slow-but-obviously-correct comparator the PBT run fuzzed against (input strategy: <code>${escapeHtml(bs.input_strategy)}</code>)</summary>
+          <pre style="font-size:11px;margin-top:6px">${escapeHtml(bs.python_oracle)}</pre>
+        </details>`
+      : '';
     return `${verdictMsg}
-      <div style="margin-top:8px"><strong>files generated:</strong> ${(r.files_changed||[]).map(p=>`<code>${escapeHtml(p)}</code>`).join(', ') || '(none)'}</div>
-      ${r.notes ? `<div class="muted" style="font-size:12px;margin-top:4px">notes: ${escapeHtml(r.notes)}</div>` : ''}
-      ${filesHtml}
-      <div style="margin-top:8px"><strong>per-invariant trace:</strong></div>
-      ${traces}`;
+      <div style="margin-top:8px"><strong>Structural invariants (validator):</strong></div>
+      ${traces}
+      <div style="margin-top:10px"><strong>Behavioral check (Property-Based Testing against reference oracle):</strong></div>
+      ${pbtTrace}
+      ${oracleBlock}`;
   }
   return '';
 }
@@ -1974,8 +2074,53 @@ function renderStep1Body(d) {
 
   const linked = renderLinkedView(d, invs);
   const graph = renderDepGraph(d, invs);
+  // Pass the explicit-present-or-missing flag so the renderer knows the
+  // difference between "not yet elicited" (null) and "elicited but
+  // missing" (undefined keys). Both currently route to the warning panel.
+  const behavioral = renderBehavioralBlock(d.behavioral_spec);
 
-  return `${csHtml}${legend}${linked}${graph}`;
+  // Behavioral block goes EARLY — it's the headline algorithmic
+  // output of Step 1 and we want it visible without scrolling past
+  // the structural panels.
+  return `${csHtml}${behavioral}${legend}${linked}${graph}`;
+}
+
+// Render the algorithmic-spec CONTRACT (function name, signature,
+// input strategy). The Lean predicate and Python reference oracle are
+// intentionally NOT shown here — the Lean appears inline in Step 2
+// (where lake build verifies it), and the oracle appears in Step 4
+// (where it's the comparator for the PBT run). Step 1 stays focused
+// on what was elicited from the brief; the test artifacts live with
+// the steps that use them.
+//
+// When the spec is missing (stale cached response or LLM elicitation
+// without the schema), show a prominent warning instead of silently
+// omitting the section — that's the failure mode the user previously hit.
+function renderBehavioralBlock(bs) {
+  if (!bs || !bs.function_name) {
+    return `<div class="verdict-box abstain" style="margin-bottom:10px">
+      <strong>⚠ No algorithmic spec in this response.</strong>
+      The elicitation did not return a <code>behavioral_spec</code> block — possibly a
+      stale cached response from before the schema was extended, or a malformed
+      LLM output. Property-Based Testing (Step 4) cannot run for this spec.
+      Re-run Step 1 to elicit a fresh spec with the algorithmic predicate.
+    </div>`;
+  }
+  return `<div class="section" style="margin:10px 0 14px;padding:12px;border:2px solid var(--accent);border-radius:6px;background:var(--panel)">
+    <div class="label" style="color:var(--accent)">▶ algorithmic-spec contract (function the agent must implement)</div>
+    <div style="font-family:var(--mono);font-size:12px;margin:6px 0">
+      <strong>function:</strong> <span class="inv-name">${escapeHtml(bs.function_name)}</span> ·
+      <strong>signature:</strong> <code>${escapeHtml(bs.signature)}</code>
+    </div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--muted)">
+      input strategy (used by Step 4 PBT): <code>${escapeHtml(bs.input_strategy)}</code>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:8px">
+      The full Lean predicate appears in <strong>Step 2 (Lean output)</strong>;
+      the Python reference oracle appears in <strong>Step 4 (Validate)</strong>
+      where it's used as the comparator for Property-Based Testing.
+    </div>
+  </div>`;
 }
 
 function renderLinkedView(d, invs) {
@@ -2226,6 +2371,7 @@ function _pipelineSpecJson() {
     starting_repo: r.spec.starting_repo,
     invariants: r.drafted_invariants,
     positive_tests: r.spec.positive_tests,
+    behavioral_spec: r.behavioral_spec || null,
   };
 }
 
@@ -2251,22 +2397,18 @@ async function runStep2() {
   }
 }
 
+// Step 3 — codegen. Calls /api/codegen, which already runs both the
+// structural validator AND the PBT runner internally; we store the
+// full response here and Step 4 reads from it to display the validation
+// results without making another API call.
 async function runStep3() {
-  if (!PIPELINE_BRIEF) { alert('no brief selected'); return; }
+  const spec_json = _pipelineSpecJson();
+  if (!spec_json) { alert('run step 1 first'); return; }
   setStep('step3', 'running');
   try {
-    const additional_sources = {};
-    if (PIPELINE_BRIEF.prose_doc) additional_sources.prose_doc = PIPELINE_BRIEF.prose_doc;
-    if (PIPELINE_BRIEF.existing_tests) additional_sources.existing_tests = PIPELINE_BRIEF.existing_tests;
-    if (PIPELINE_BRIEF.slide_deck) additional_sources.slide_deck = PIPELINE_BRIEF.slide_deck;
-    const r = await fetchJSON('/api/elicit/compare', {
+    const r = await fetchJSON('/api/codegen', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        description: PIPELINE_BRIEF.description,
-        starting_repo: PIPELINE_BRIEF.starting_repo,
-        models: null,
-        task_id: 'pipeline_compare_' + Date.now(),
-      }),
+      body: JSON.stringify({spec_json}),
     });
     setStep('step3', 'done', r);
   } catch (e) {
@@ -2274,19 +2416,17 @@ async function runStep3() {
   }
 }
 
+// Step 4 — validate. Pure UI render of step3's result. No API call.
+// Marks itself as 'done' if step3 has a result; 'failed' otherwise.
 async function runStep4() {
-  const spec_json = _pipelineSpecJson();
-  if (!spec_json) { alert('run step 1 first'); return; }
-  setStep('step4', 'running');
-  try {
-    const r = await fetchJSON('/api/codegen', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({spec_json}),
-    });
-    setStep('step4', 'done', r);
-  } catch (e) {
-    setStep('step4', 'failed', null, e.message);
+  const s3 = PIPELINE_STATE.step3;
+  if (!s3 || s3.status !== 'done' || !s3.result) {
+    setStep('step4', 'failed', null, 'Run Step 3 (code generation) first.');
+    return;
   }
+  // Mirror the codegen result as step4's state so renderStep4Body has
+  // something to render. The actual validation already ran in /api/codegen.
+  setStep('step4', 'done', s3.result);
 }
 
 document.getElementById('pipeline-run-all').addEventListener('click', async () => {

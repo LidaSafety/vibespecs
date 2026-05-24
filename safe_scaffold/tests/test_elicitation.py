@@ -41,6 +41,15 @@ _GOOD_PAYLOAD = {
         "max_diff_lines": "small addition",
         "positive_test": "covers the new function",
     },
+    # behavioral_spec is required by the elicitation schema; tests
+    # below use a trivial constant function as the placeholder.
+    "behavioral_spec": {
+        "function_name": "f",
+        "signature": "f() -> int",
+        "lean_predicate": "def fSpec : Prop := True",
+        "python_oracle": "def f() -> int:\n    return 1\n",
+        "input_strategy": "integers()",
+    },
 }
 
 

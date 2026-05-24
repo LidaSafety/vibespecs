@@ -37,6 +37,7 @@ from safe_scaffold.task_spec.spec import (
     TaskSpec,
     Verdict,
 )
+from safe_scaffold.task_spec.verify_pbt import PBTResult, verify_against_oracle
 
 
 _CODEGEN_SYSTEM_PROMPT = """You are an AI coding agent implementing a task that has a formal spec.
@@ -76,17 +77,29 @@ Hard rules (re-read carefully):
 
 @dataclass(frozen=True)
 class CodegenResult:
-    """Outcome of one round of LLM code generation."""
+    """Outcome of one round of LLM code generation.
+
+    `verdict` is the structural validator's accept/reject (file scope,
+    forbidden imports, diff size, secrets, positive test).
+    `pbt_result` is the additional behavioral verification: did the
+    LLM-emitted Python oracle agree with the agent's implementation on
+    every Hypothesis input? Both must succeed for `ok` to be True.
+    """
 
     modified_repo: dict[str, str] = field(default_factory=dict)
     verdict: Verdict | None = None
+    pbt_result: PBTResult | None = None
     raw_response: str = ""
     error: str = ""
     notes: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.verdict is not None and self.verdict.accepted
+        structural_ok = self.verdict is not None and self.verdict.accepted
+        # If the spec has no behavioral_spec, pbt is skipped (None);
+        # don't penalize. If it ran, require `verified`.
+        behavioral_ok = self.pbt_result is None or self.pbt_result.ok
+        return structural_ok and behavioral_ok
 
     @property
     def files_changed(self) -> list[str]:
@@ -306,9 +319,27 @@ def generate_code(
     )
     verdict = StructuredValidator().evaluate(spec, candidate)
 
+    # Behavioral verification: if the spec carries an algorithmic
+    # behavioral_spec, fuzz the agent's code against the elicited
+    # Python reference oracle on inputs drawn from input_strategy.
+    # `verified` = no counterexample in N runs; `falsified` = shrunken
+    # CE returned; `error` = oracle threw, missing toolchain, etc.
+    pbt_result = None
+    if spec.behavioral_spec is not None:
+        try:
+            pbt_result = verify_against_oracle(spec, modified_repo)
+        except Exception as exc:
+            # Surface as an error PBTResult rather than failing the
+            # whole codegen call. CodegenResult.ok = False in this case.
+            pbt_result = PBTResult(
+                outcome="error",
+                detail=f"PBT runner raised: {type(exc).__name__}: {exc}",
+            )
+
     return CodegenResult(
         modified_repo=modified_repo,
         verdict=verdict,
+        pbt_result=pbt_result,
         raw_response=text,
         notes=str(payload.get("notes", "")),
     )

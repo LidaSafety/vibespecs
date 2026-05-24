@@ -36,6 +36,39 @@ class PositiveTest:
 
 
 @dataclass(frozen=True)
+class BehavioralSpec:
+    """The algorithmic content of a spec — what the function should *do*.
+
+    The elicitation pipeline produces this alongside the structural
+    invariants in `TaskSpec.negative_invariants`. It captures the
+    algorithm in three forms:
+
+    - `lean_predicate`: a Lean 4 `def ... : Prop` expressing the
+      mathematical content of the intent. Emitted into the same .lean
+      file as the structural Diff predicates and type-checked by
+      `lake build`.
+    - `python_oracle`: an obviously-correct, slow Python reference
+      implementation of the same predicate. Used by the PBT verifier
+      (see `task_spec/verify_pbt.py`) as the comparator the agent's
+      generated code must match on randomized inputs.
+    - `input_strategy`: a Hypothesis strategy expression (e.g.
+      "integers(min_value=0, max_value=200)") drawing the inputs to
+      compare on.
+
+    Authoring philosophy: the LLM elicits all three from the NL intent
+    *without* seeing any implementation. The oracle is "slow but
+    obviously right" — the agent's job is to write a different,
+    optimized implementation that produces the same outputs.
+    """
+
+    function_name: str
+    signature: str          # e.g. "is_not_prime(n: int) -> bool"
+    lean_predicate: str     # the Lean 4 def, e.g. "def isNotPrime (n : Nat) : Prop := ..."
+    python_oracle: str      # reference impl, e.g. "def is_not_prime(n: int) -> bool: ..."
+    input_strategy: str     # Hypothesis strategy expression
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     """A complete spec for one coding task.
 
@@ -44,6 +77,10 @@ class TaskSpec:
       starting_repo:      existing project state (often imported, not authored)
       positive_tests:     tests that must pass after the agent runs
       negative_invariants: structural constraints on the diff
+      behavioral_spec:    algorithmic content (Lean predicate + Python oracle)
+                          — required by the elicitation pipeline, optional in
+                          the dataclass so hand-authored corpus tasks that
+                          predate this field still type-check
 
     Authoring time per spec is dominated by writing the positive tests,
     which is work the user would do anyway in TDD. The invariants are the
@@ -63,6 +100,10 @@ class TaskSpec:
     # authoring time so we can aggregate later without a user study.
     authoring_seconds: int = 0
     authoring_loc: int = 0  # excluding starting_repo
+    # Algorithmic spec produced by the elicitation pipeline. None on the
+    # hand-authored toy corpus (where there's no LLM step); always present
+    # on elicited specs since the elicitation schema requires it.
+    behavioral_spec: BehavioralSpec | None = None
 
 
 class CandidateLabel(enum.Enum):

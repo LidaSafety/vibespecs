@@ -149,6 +149,25 @@ def emit_lean(spec: TaskSpec, *, module_name: str | None = None) -> str:
         f"Auto-emitted from TaskSpec {spec.task_id!r}.\n"
         f"Description: {spec.description}"
     )
+
+    # Behavioral block: when the spec carries a BehavioralSpec, splice its
+    # Lean predicate into the same module after the structural `spec`.
+    # The predicate is verbatim from elicitation — lake build will reject
+    # it if it doesn't type-check (no fallback, per design).
+    behavioral_block = ""
+    bs = getattr(spec, "behavioral_spec", None)
+    if bs is not None:
+        sig_comment = _format_block_comment(
+            f"Algorithmic spec — the function's intended behavior.\n"
+            f"Python signature: {bs.signature}\n"
+            f"Verified at the spec layer by `lake build` (well-typedness)\n"
+            f"and at the impl layer by the PBT runner "
+            f"(`verify_against_oracle`) which fuzzes the agent's code "
+            f"against the Python reference oracle on inputs drawn from "
+            f"`{bs.input_strategy}`."
+        )
+        behavioral_block = f"\n{sig_comment}\n{bs.lean_predicate.rstrip()}\n"
+
     return f"""import SafeScaffold.Basic
 
 namespace {ns}
@@ -158,7 +177,7 @@ open SafeScaffold
 {docstring}
 def spec (d : Diff) : Prop :=
     {body}
-{skipped_block}
+{skipped_block}{behavioral_block}
 end {ns}
 """
 

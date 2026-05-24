@@ -36,7 +36,9 @@ from safe_scaffold.task_spec.invariants import (
     OnlyFilesModified,
     PositiveTestPasses,
 )
-from safe_scaffold.task_spec.spec import PositiveTest, RepoState, TaskSpec
+from safe_scaffold.task_spec.spec import (
+    BehavioralSpec, PositiveTest, RepoState, TaskSpec,
+)
 
 
 _ELICIT_SYSTEM_PROMPT = """You are drafting a task specification for a code-editing AI agent.
@@ -57,18 +59,36 @@ You MUST respond with a single JSON object of this exact shape and nothing else:
     "name": "<short_name>",                    // human label
     "code": "..."                              // full pytest source, including imports, that exercises the intent
   },
+  "behavioral_spec": {                         // THE ALGORITHMIC CONTENT OF THE INTENT — REQUIRED
+    "function_name": "is_not_prime",           // the principal Python function the spec is about
+    "signature": "is_not_prime(n: int) -> bool",  // Python signature
+    "lean_predicate": "def isNotPrime (n : Nat) : Prop := n < 2 ∨ ∃ k, 2 ≤ k ∧ k < n ∧ n % k = 0",
+                                                // a Lean 4 def expressing the algorithmic content.
+                                                // MUST type-check under Lean 4 stdlib (no mathlib).
+                                                // Use ASCII connectives if you must but unicode (∀ ∃ ∧ ∨) is preferred.
+    "python_oracle": "def is_not_prime(n: int) -> bool:\\n    if n < 2:\\n        return True\\n    return any(n % k == 0 for k in range(2, n))",
+                                                // an OBVIOUSLY-CORRECT, slow Python reference implementation.
+                                                // Used by the PBT verifier as the comparator the agent's
+                                                // optimized code must match. Keep it close to the math.
+    "input_strategy": "integers(min_value=0, max_value=200)"
+                                                // a Hypothesis strategy expression. Recognized names:
+                                                // integers, lists, text, booleans, floats, tuples, sampled_from.
+                                                // Use bounded ranges for integers/floats so PBT terminates.
+  },
   "rationale": {
     "allowed_files": "one short sentence",
     "forbidden_imports": "one short sentence",
     "max_diff_lines": "one short sentence",
-    "positive_test": "one short sentence"
+    "positive_test": "one short sentence",
+    "behavioral_spec": "one short sentence — what algorithm the spec captures"
   },
   "provenance": {
     "allowed_files":     {"grounding": "explicit|inferred|default", "source_phrase": "the exact phrase from the brief that justifies this, or empty"},
     "forbidden_imports": {"grounding": "explicit|inferred|default", "source_phrase": "..."},
     "max_diff_lines":    {"grounding": "explicit|inferred|default", "source_phrase": "..."},
     "check_secrets":     {"grounding": "explicit|inferred|default", "source_phrase": "..."},
-    "positive_test":     {"grounding": "explicit|inferred|default", "source_phrase": "..."}
+    "positive_test":     {"grounding": "explicit|inferred|default", "source_phrase": "..."},
+    "behavioral_spec":   {"grounding": "explicit|inferred|default", "source_phrase": "..."}
   }
 }
 
@@ -77,9 +97,27 @@ Provenance rules (very important for the reviewer UI):
 - "inferred"  → not stated but reasonable given the repo files (e.g. "max_diff_lines=20 because the task is trivially small").
 - "default"   → no evidence; you're falling back to a safe default that a human should review. source_phrase MUST be empty.
 
+Behavioral-spec rules (these are NEW and the most important — read carefully):
+- The Lean predicate captures the MATH, not the implementation. For `is_not_prime`,
+  it's "n is < 2 OR has a divisor in [2, n)", not "use trial division".
+- The Lean predicate MUST type-check against Lean 4 stdlib alone. Allowed:
+  Nat, Int, Bool, String, List, ∀ ∃ ∧ ∨ ¬ < ≤ = ∈ % + - * /, basic List.length / List.head?.
+  DO NOT use mathlib (no Mathlib imports, no Polynomial, no Real, no Finset).
+- The Python oracle is a SEPARATE, slow-but-obviously-right reference implementation.
+  It should call only Python stdlib and re-express the same predicate as executable
+  code. The agent's optimized implementation will be tested against this oracle on
+  random inputs drawn from `input_strategy`.
+- The function_name MUST match what the agent's implementation will export.
+- The signature MUST use Python type hints and match Python's actual types
+  (use `int`, not `Nat`, in Python).
+- If the task isn't a pure function (e.g. "add a JWT middleware"), choose the
+  closest input-to-output mapping (e.g. `verify_token(header: str) -> bool`)
+  and express that algorithmically. Behavioral spec is REQUIRED — there is no
+  opt-out — pick the function-shaped slice that best captures the intent.
+
 Hard rules:
 - Output ONLY the JSON object. No markdown fences, no commentary.
-- Every field above is required (including every key inside provenance).
+- Every field above is required (including every key inside provenance and behavioral_spec).
 - positive_test.code must be valid Python that imports from the modified module(s) and uses assert statements.
 - forbidden_imports should be a SUBSET of: os, subprocess, socket, requests, urllib, http, shutil, ctypes, pickle.
 - allowed_files paths must be relative, must already exist in the repo or be obviously the file the task is about.
@@ -156,12 +194,49 @@ _ALLOWED_FORBIDDEN_IMPORTS = frozenset({
 })
 
 
+# Hypothesis strategies the elicitation prompt advertises. Validation rejects
+# anything that doesn't start with one of these names — keeps the surface
+# small enough that the PBT runner can evaluate it safely.
+_ALLOWED_HYPOTHESIS_STRATEGIES = (
+    "integers", "lists", "text", "booleans", "floats", "tuples",
+    "sampled_from", "binary", "characters", "fixed_dictionaries",
+)
+
+
+def _validate_behavioral_spec(bs: Any) -> str:
+    """Validate the `behavioral_spec` block. Empty string on success."""
+    if not isinstance(bs, dict):
+        return "behavioral_spec must be an object"
+    for k in ("function_name", "signature", "lean_predicate",
+              "python_oracle", "input_strategy"):
+        if k not in bs or not isinstance(bs[k], str) or not bs[k].strip():
+            return f"behavioral_spec.{k} must be a non-empty string"
+    name = bs["function_name"].strip()
+    if not name.isidentifier() or name.startswith("_"):
+        return (f"behavioral_spec.function_name must be a valid public "
+                f"Python identifier (got {name!r})")
+    if name not in bs["signature"]:
+        return (f"behavioral_spec.signature must contain function_name "
+                f"({name!r})")
+    if "def " not in bs["lean_predicate"]:
+        return "behavioral_spec.lean_predicate must contain a Lean `def`"
+    if f"def {name}" not in bs["python_oracle"]:
+        return (f"behavioral_spec.python_oracle must define `def {name}(...)`")
+    strat = bs["input_strategy"].strip()
+    if not any(strat.startswith(s + "(") or strat == s
+                for s in _ALLOWED_HYPOTHESIS_STRATEGIES):
+        return (f"behavioral_spec.input_strategy must start with one of "
+                f"{list(_ALLOWED_HYPOTHESIS_STRATEGIES)} (got {strat!r})")
+    return ""
+
+
 def _validate_payload(payload: Any) -> str:
     """Return '' if the JSON payload has the right shape; else an error string."""
     if not isinstance(payload, dict):
         return "top-level value is not an object"
     required = ["allowed_files", "forbidden_imports", "max_diff_lines",
-                "check_secrets", "positive_test", "rationale"]
+                "check_secrets", "positive_test", "rationale",
+                "behavioral_spec"]
     for k in required:
         if k not in payload:
             return f"missing required field: {k}"
@@ -187,6 +262,9 @@ def _validate_payload(payload: Any) -> str:
             return f"positive_test.{k} must be a non-empty string"
     if "def test_" not in pt["code"]:
         return "positive_test.code must define at least one test_* function"
+    bs_err = _validate_behavioral_spec(payload["behavioral_spec"])
+    if bs_err:
+        return bs_err
     return ""
 
 
@@ -234,6 +312,15 @@ def _materialize(payload: dict, task_id: str, description: str,
     pt = payload["positive_test"]
     positive_test = PositiveTest(path=pt["path"], code=pt["code"], name=pt["name"])
 
+    bs_dict = payload["behavioral_spec"]
+    behavioral_spec = BehavioralSpec(
+        function_name=bs_dict["function_name"].strip(),
+        signature=bs_dict["signature"].strip(),
+        lean_predicate=bs_dict["lean_predicate"].strip(),
+        python_oracle=bs_dict["python_oracle"],     # preserve indentation
+        input_strategy=bs_dict["input_strategy"].strip(),
+    )
+
     spec = TaskSpec(
         task_id=task_id,
         description=description,
@@ -245,6 +332,7 @@ def _materialize(payload: dict, task_id: str, description: str,
         category=category,
         authoring_seconds=0,
         authoring_loc=0,
+        behavioral_spec=behavioral_spec,
     )
 
     return DraftSpec(
