@@ -36,7 +36,12 @@ from safe_scaffold.task_spec.lean_emitter import (
 from safe_scaffold.task_spec.ears_emitter import emit_ears
 from safe_scaffold.task_spec.ambiguous_briefs import AMBIGUOUS_BRIEFS, BRIEFS_BY_ID
 from safe_scaffold.task_spec.datasets import all_dataset_briefs
-from safe_scaffold.task_spec.codegen import generate_code
+from safe_scaffold.task_spec.codegen import generate_code, generate_code_only
+from safe_scaffold.task_spec.syntax_check import check_python_syntax
+from safe_scaffold.task_spec.test_case_gen import (
+    generate_test_cases, run_test_cases,
+)
+from safe_scaffold.task_spec.verify_pbt import verify_against_oracle
 from safe_scaffold.task_spec.spec import Candidate, CandidateLabel
 from safe_scaffold.task_spec.spec_mutation import (
     coverage_by_kind,
@@ -454,6 +459,139 @@ def api_codegen(req: CodegenRequest) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Iterative-pipeline endpoints. The Iterative tab gives the user
+# per-step buttons: emit code, syntax-check, generate test cases, run
+# them, run PBT. Each runs on the *current edited state* in the
+# browser, not a frozen snapshot from earlier in the pipeline.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/codegen_emit")
+def api_codegen_emit(req: CodegenRequest) -> dict[str, Any]:
+    """Lightweight codegen: emit Python from the spec, NO validation.
+
+    The iterative tab uses this so the user can read + edit the
+    generated code BEFORE we run the validator or PBT. The full-validation
+    variant is `/api/codegen`.
+    """
+    spec = _spec_from_request(EmitLeanRequest(spec_json=req.spec_json))
+    result = generate_code_only(spec)
+    return {
+        "ok": not result.error and bool(result.modified_repo),
+        "error": result.error,
+        "notes": result.notes,
+        "files_changed": result.files_changed,
+        "modified_repo": result.modified_repo,
+        "raw_response": result.raw_response,
+    }
+
+
+class SyntaxCheckRequest(BaseModel):
+    files: dict[str, str]
+
+
+@app.post("/api/python_syntax_check")
+def api_python_syntax_check(req: SyntaxCheckRequest) -> dict[str, Any]:
+    """ast.parse each file; report SyntaxError with line + offset + msg."""
+    return {"results": check_python_syntax(req.files)}
+
+
+class VerifyLeanTextRequest(BaseModel):
+    source: str
+    namespace: str = "Spec_Edited"
+
+
+@app.post("/api/verify_lean_text")
+def api_verify_lean_text(req: VerifyLeanTextRequest) -> dict[str, Any]:
+    """Run `lake build` on a verbatim Lean source string.
+
+    The iterative tab uses this for the "Syntax check (lake build)"
+    button — the user may have edited the Lean by hand, so we can't
+    reconstruct it from a spec.
+    """
+    if not lean_available():
+        raise HTTPException(503, "Lean toolchain not installed")
+    result = verify_lean(req.source)
+    return {
+        "source": req.source,
+        "ok": result.ok,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_seconds": round(result.duration_seconds, 3),
+        "lean_version": result.lean_version,
+    }
+
+
+@app.post("/api/generate_test_cases")
+def api_generate_test_cases(req: CodegenRequest) -> dict[str, Any]:
+    """Spec → ~8 concrete (input, expected, rationale) cases via LLM call."""
+    spec = _spec_from_request(EmitLeanRequest(spec_json=req.spec_json))
+    tcs = generate_test_cases(spec)
+    return {
+        "ok": tcs.ok,
+        "error": tcs.error,
+        "raw_response": tcs.raw_response,
+        "cases": [
+            {"input": c.input, "expected": c.expected, "rationale": c.rationale}
+            for c in tcs.cases
+        ],
+    }
+
+
+class RunCasesRequest(BaseModel):
+    files: dict[str, str]
+    function_name: str
+    cases: list[dict[str, Any]]
+
+
+@app.post("/api/run_test_cases")
+def api_run_test_cases(req: RunCasesRequest) -> dict[str, Any]:
+    """Run each case against `files[*]` importing `function_name`."""
+    results = run_test_cases(req.files, req.function_name, req.cases)
+    return {"results": results}
+
+
+class PBTOnlyRequest(BaseModel):
+    spec_json: dict[str, Any]
+    generated_repo: dict[str, str]
+
+
+@app.post("/api/pbt_only")
+def api_pbt_only(req: PBTOnlyRequest) -> dict[str, Any]:
+    """Run PBT-against-oracle on the user-provided generated_repo.
+
+    The iterative tab calls this with the current code in the editor
+    (which may differ from what /api/codegen_emit originally produced).
+    """
+    spec = _spec_from_request(EmitLeanRequest(spec_json=req.spec_json))
+    if spec.behavioral_spec is None:
+        return {
+            "outcome": "error",
+            "detail": "spec has no behavioral_spec; cannot run PBT",
+            "counterexample": "",
+            "duration_seconds": 0.0,
+            "n_runs": 0,
+        }
+    try:
+        r = verify_against_oracle(spec, req.generated_repo)
+    except Exception as exc:
+        return {
+            "outcome": "error",
+            "detail": f"PBT runner raised: {type(exc).__name__}: {exc}",
+            "counterexample": "",
+            "duration_seconds": 0.0,
+            "n_runs": 0,
+        }
+    return {
+        "outcome": r.outcome,
+        "detail": r.detail,
+        "counterexample": r.counterexample,
+        "duration_seconds": round(r.duration_seconds, 3),
+        "n_runs": r.n_runs,
+    }
+
+
 class CompareRequest(BaseModel):
     description: str
     starting_repo: dict[str, str]
@@ -662,6 +800,27 @@ INDEX_HTML = r"""<!doctype html>
   .pcard-actions button.primary{background:var(--accent);color:#0f1419;border:0;font-weight:600}
   /* Provenance chips (DaeDaLus / Lean Atlas inspired). */
   .prov-chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-family:var(--mono);font-weight:600;letter-spacing:0.3px;margin-left:8px;border:1px solid var(--border)}
+  /* Iterative pipeline tab. */
+  details.iter-section{border:1px solid var(--border);border-radius:8px;margin-bottom:12px;background:var(--bg)}
+  details.iter-section > summary{padding:10px 14px;cursor:pointer;font-size:14px;background:var(--panel);border-radius:8px 8px 0 0;list-style:none}
+  details.iter-section > summary::-webkit-details-marker{display:none}
+  details.iter-section[open] > summary{border-bottom:1px solid var(--border);border-radius:8px 8px 0 0}
+  details.iter-section .iter-body{padding:12px 14px}
+  details.iter-section .iter-actions{display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
+  .iter-status{font-size:11px;font-family:var(--mono);color:var(--muted);padding:3px 8px;border-radius:10px}
+  .iter-status.ok{color:var(--green);border:1px solid var(--green);background:rgba(158,206,106,0.08)}
+  .iter-status.err{color:var(--red);border:1px solid var(--red);background:rgba(247,118,142,0.08)}
+  .iter-status.running{color:var(--yellow);border:1px solid var(--yellow);background:rgba(224,175,104,0.08)}
+  .iter-case-row{display:grid;grid-template-columns:1fr 1fr 1.5fr 30px;gap:6px;margin-bottom:6px;align-items:start}
+  .iter-case-row input,.iter-case-row textarea{font-family:var(--mono);font-size:11px;padding:6px;min-height:32px;background:var(--panel);color:var(--fg);border:1px solid var(--border);border-radius:4px;resize:vertical}
+  .iter-case-row .del{background:var(--red);color:#0f1419;padding:4px 8px;font-size:11px;align-self:flex-start;border-radius:4px;border:0;cursor:pointer}
+  .iter-case-header{display:grid;grid-template-columns:1fr 1fr 1.5fr 30px;gap:6px;font-size:10px;text-transform:uppercase;color:var(--muted);margin-bottom:4px;letter-spacing:0.5px}
+  table.iter-results{width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono);margin-top:8px}
+  table.iter-results th,table.iter-results td{padding:5px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+  table.iter-results th{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:0.5px}
+  table.iter-results tr.pass td{color:var(--green)}
+  table.iter-results tr.fail td{color:var(--red)}
+  table.iter-results tr.error td{color:var(--yellow)}
   .prov-chip.explicit{color:var(--green);border-color:var(--green);background:rgba(158,206,106,0.08)}
   .prov-chip.inferred{color:var(--yellow);border-color:var(--yellow);background:rgba(224,175,104,0.08)}
   .prov-chip.default{color:var(--red);border-color:var(--red);background:rgba(247,118,142,0.08)}
@@ -715,6 +874,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="demo-banner" style="display:none;position:sticky;top:0;z-index:10;padding:10px 20px;background:var(--accent);color:#0f1419;font-weight:600;font-size:13px"></div>
 <nav class="tabs">
   <button data-view="pipeline" class="active">▶ 4-step pipeline</button>
+  <button data-view="iterative">▼ Iterative pipeline</button>
   <button data-view="validate">Validate corpus</button>
   <button data-view="elicit">Draft a spec (LLM)</button>
   <button data-view="compare">Compare drafts</button>
@@ -835,6 +995,118 @@ INDEX_HTML = r"""<!doctype html>
     <button id="mutate-btn" style="margin-left:8px">Run mutations →</button>
   </div>
   <div id="mutate-result"><div class="placeholder">pick a task (or "whole corpus") and hit Run</div></div>
+</main>
+</div>
+
+<div class="view" id="view-iterative">
+<div id="iter-toolbar" style="display:flex;gap:10px;align-items:center;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+  <strong style="font-size:13px">Iterative pipeline</strong>
+  <span class="muted">·</span>
+  <span class="muted" style="font-size:12px">brief:</span>
+  <select id="iter-brief-picker" style="background:var(--panel);color:var(--fg);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;flex:1"></select>
+  <button id="iter-export-btn" style="background:var(--accent);color:#0f1419">Export bundle ↓</button>
+</div>
+<main class="split1">
+  <div class="muted" style="margin-bottom:12px;font-size:13px">
+    Per-step buttons let you edit any artifact and re-check it. Every section is
+    collapsible — click the title to fold/expand. The Export button dumps the
+    current state of every section as a single JSON file.
+  </div>
+
+  <details open class="iter-section">
+    <summary><strong>Section 1 · Input</strong> — load a fixture or write a request</summary>
+    <div class="iter-body">
+      <div class="label">intent (one sentence)</div>
+      <input type="text" id="iter-intent" style="width:100%" placeholder="e.g. Write a python function to identify non-prime numbers"/>
+      <div class="label" style="margin-top:8px">starting repo (path + contents)</div>
+      <div id="iter-files"></div>
+      <button id="iter-add-file" style="background:var(--panel);color:var(--fg);border:1px solid var(--border);font-weight:400">+ add file</button>
+      <details style="margin-top:10px">
+        <summary class="muted" style="cursor:pointer;font-size:12px">+ optional ground-truth spec / code (passed through to export, not used by validation)</summary>
+        <div style="margin-top:6px">
+          <div class="label">ground_truth_spec (Lean, EARS, or freeform)</div>
+          <textarea id="iter-gt-spec" class="small" placeholder="optional"></textarea>
+          <div class="label" style="margin-top:6px">ground_truth_code (canonical solution, if known)</div>
+          <textarea id="iter-gt-code" class="small" placeholder="optional"></textarea>
+        </div>
+      </details>
+      <div class="iter-actions">
+        <button id="iter-elicit-btn" class="primary">Elicit spec →</button>
+        <span id="iter-elicit-status" class="iter-status"></span>
+      </div>
+      <div id="iter-elicit-result"></div>
+    </div>
+  </details>
+
+  <details open class="iter-section">
+    <summary><strong>Section 2 · Lean spec</strong> — editable; check with <code>lake build</code></summary>
+    <div class="iter-body">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">
+        Generated from the spec in Section 1; edit freely. The structural
+        invariants AND the algorithmic Lean predicate live here.
+      </div>
+      <textarea id="iter-lean" style="min-height:240px" placeholder="Run Section 1 first to populate"></textarea>
+      <div class="iter-actions">
+        <button id="iter-lean-check-btn">Syntax check (lake build)</button>
+        <span id="iter-lean-status" class="iter-status"></span>
+      </div>
+      <div id="iter-lean-result"></div>
+    </div>
+  </details>
+
+  <details open class="iter-section">
+    <summary><strong>Section 3 · Python code</strong> — editable; check with <code>ast.parse</code></summary>
+    <div class="iter-body">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">
+        Generated from the spec; edit freely per file. The syntax checker
+        catches Python <code>SyntaxError</code> with line + column before you
+        burn a PBT run on a file that doesn't parse.
+      </div>
+      <div id="iter-code-files"><div class="placeholder">Click "Generate code" to populate</div></div>
+      <div class="iter-actions">
+        <button id="iter-codegen-btn" class="primary">Generate code →</button>
+        <button id="iter-code-check-btn">Syntax check (ast.parse)</button>
+        <span id="iter-code-status" class="iter-status"></span>
+      </div>
+      <div id="iter-code-result"></div>
+    </div>
+  </details>
+
+  <details open class="iter-section">
+    <summary><strong>Section 4 · Test cases</strong> — LLM-generated from spec (without looking at code), editable</summary>
+    <div class="iter-body">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">
+        The LLM emits ~8 concrete <code>{input, expected, rationale}</code>
+        tuples from the description + Lean predicate + reference oracle. Inputs
+        and expecteds are Python literal expressions (<code>ast.literal_eval</code>
+        accepts them). Edit any cell, add or remove rows, then run.
+      </div>
+      <div id="iter-cases"><div class="placeholder">Click "Generate cases" to populate</div></div>
+      <div class="iter-actions">
+        <button id="iter-cases-gen-btn" class="primary">Generate cases →</button>
+        <button id="iter-cases-add-btn">+ add empty row</button>
+        <button id="iter-cases-run-btn">Run against current code</button>
+        <span id="iter-cases-status" class="iter-status"></span>
+      </div>
+      <div id="iter-cases-result"></div>
+    </div>
+  </details>
+
+  <details open class="iter-section">
+    <summary><strong>Section 5 · Property-Based Testing</strong> — Hypothesis vs the reference oracle (200 examples)</summary>
+    <div class="iter-body">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">
+        Available only when Section 1 produced a <code>behavioral_spec</code> with a
+        Python reference oracle. Runs the agent's current code against the
+        oracle on 200 Hypothesis-drawn inputs from the spec's input strategy.
+      </div>
+      <div class="iter-actions">
+        <button id="iter-pbt-btn" class="primary">Run PBT vs oracle →</button>
+        <span id="iter-pbt-status" class="iter-status"></span>
+      </div>
+      <div id="iter-pbt-result"></div>
+    </div>
+  </details>
 </main>
 </div>
 <script>
@@ -2444,6 +2716,467 @@ document.getElementById('pipeline-run-all').addEventListener('click', async () =
 });
 
 pipelineLoadBriefs();
+
+// ---------------------------------------------------------------------------
+// Iterative pipeline tab — per-button editable artifacts + export.
+// ---------------------------------------------------------------------------
+
+// One unified state object. Every editable textarea / input writes
+// back here on `input`. The Export button serialises the whole object.
+const IT_STATE = {
+  brief_id: null,
+  intent: '',
+  starting_repo: {},      // {path: code}
+  ground_truth_spec: '',
+  ground_truth_code: '',
+  drafted: null,          // /api/elicit response
+  behavioral_spec: null,
+  lean_source: '',        // current editable Lean
+  lean_verify: null,      // {ok, stdout, stderr, duration_seconds}
+  code_repo: {},          // {path: code} — current editable code
+  code_syntax: null,      // [{path, ok, line?, msg?}]
+  test_cases: [],         // [{input, expected, rationale}]
+  test_results: null,     // [{input, expected, got, status, error?}]
+  pbt: null,              // {outcome, detail, counterexample, ...}
+};
+let IT_FILES = [];        // {path, code}[] — UI rows for starting_repo
+
+function _itRenderFiles() {
+  const host = document.getElementById('iter-files');
+  host.innerHTML = IT_FILES.map((f, i) => `
+    <div class="file-row">
+      <input type="text" data-i="${i}" data-k="path" value="${escapeHtml(f.path)}" placeholder="path"/>
+      <textarea data-i="${i}" data-k="code" placeholder="contents">${escapeHtml(f.code)}</textarea>
+      <button class="del" data-i="${i}">×</button>
+    </div>`).join('');
+  host.querySelectorAll('input, textarea').forEach(el => {
+    el.addEventListener('input', () => {
+      IT_FILES[+el.dataset.i][el.dataset.k] = el.value;
+      IT_STATE.starting_repo = Object.fromEntries(
+        IT_FILES.filter(f => f.path).map(f => [f.path, f.code]));
+    });
+  });
+  host.querySelectorAll('button.del').forEach(el => {
+    el.addEventListener('click', () => {
+      IT_FILES.splice(+el.dataset.i, 1);
+      _itRenderFiles();
+    });
+  });
+}
+
+document.getElementById('iter-add-file').addEventListener('click', () => {
+  IT_FILES.push({path: '', code: ''});
+  _itRenderFiles();
+});
+
+document.getElementById('iter-intent').addEventListener('input', e => {
+  IT_STATE.intent = e.target.value;
+});
+document.getElementById('iter-gt-spec').addEventListener('input', e => {
+  IT_STATE.ground_truth_spec = e.target.value;
+});
+document.getElementById('iter-gt-code').addEventListener('input', e => {
+  IT_STATE.ground_truth_code = e.target.value;
+});
+
+function _setStatus(elId, text, cls) {
+  const el = document.getElementById(elId);
+  el.className = 'iter-status ' + (cls || '');
+  el.textContent = text || '';
+}
+
+// ----- Brief picker (re-fetches /api/ambiguous_briefs)
+(async () => {
+  try {
+    const r = await fetchJSON('/api/ambiguous_briefs');
+    const sel = document.getElementById('iter-brief-picker');
+    const opt0 = document.createElement('option');
+    opt0.value = '';
+    opt0.textContent = '— start blank —';
+    sel.appendChild(opt0);
+    for (const b of r.briefs) {
+      const opt = document.createElement('option');
+      opt.value = b.brief_id;
+      opt.dataset.source = b.source || '';
+      opt.textContent = `[${b.source || 'custom'}] ${b.label}`;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', () => {
+      const b = r.briefs.find(x => x.brief_id === sel.value);
+      if (!b) return;
+      IT_STATE.brief_id = b.brief_id;
+      IT_STATE.intent = b.description;
+      document.getElementById('iter-intent').value = b.description;
+      IT_FILES = Object.entries(b.starting_repo).map(([path, code]) => ({path, code}));
+      IT_STATE.starting_repo = {...b.starting_repo};
+      _itRenderFiles();
+      // For MBPP/HumanEval briefs, the existing_tests field carries the
+      // benchmark's canonical assertion list — surface it as ground-truth
+      // code so the reviewer can compare it to what the LLM produces.
+      if (b.existing_tests) {
+        IT_STATE.ground_truth_code = b.existing_tests;
+        document.getElementById('iter-gt-code').value = b.existing_tests;
+      }
+      if (b.prose_doc) {
+        IT_STATE.ground_truth_spec = b.prose_doc;
+        document.getElementById('iter-gt-spec').value = b.prose_doc;
+      }
+    });
+  } catch (e) {/* picker is optional */}
+})();
+
+// ----- Section 1: Elicit
+document.getElementById('iter-elicit-btn').addEventListener('click', async () => {
+  if (!IT_STATE.intent.trim()) { alert('intent is empty'); return; }
+  if (!Object.keys(IT_STATE.starting_repo).length) {
+    alert('add at least one starting file'); return;
+  }
+  _setStatus('iter-elicit-status', 'eliciting…', 'running');
+  try {
+    const r = await fetchJSON('/api/elicit', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        description: IT_STATE.intent,
+        starting_repo: IT_STATE.starting_repo,
+        task_id: 'iter_' + Date.now(),
+      }),
+    });
+    IT_STATE.drafted = r;
+    IT_STATE.behavioral_spec = r.behavioral_spec;
+    _setStatus('iter-elicit-status', r.ok ? 'spec drafted ✓' : 'failed',
+                r.ok ? 'ok' : 'err');
+    document.getElementById('iter-elicit-result').innerHTML = _itRenderElicitResult(r);
+    // Pre-populate Section 2's Lean source by emitting from the spec.
+    if (r.ok) {
+      const leanResp = await fetchJSON('/api/emit_lean', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({spec_json: _itSpecJson()}),
+      });
+      IT_STATE.lean_source = leanResp.source;
+      document.getElementById('iter-lean').value = leanResp.source;
+    }
+  } catch (e) {
+    _setStatus('iter-elicit-status', 'error: ' + e.message, 'err');
+  }
+});
+
+function _itSpecJson() {
+  const r = IT_STATE.drafted;
+  if (!r || !r.spec) return null;
+  return {
+    task_id: r.spec.task_id,
+    description: r.spec.description,
+    starting_repo: r.spec.starting_repo,
+    invariants: r.drafted_invariants,
+    positive_tests: r.spec.positive_tests,
+    behavioral_spec: r.behavioral_spec,
+  };
+}
+
+function _itRenderElicitResult(r) {
+  if (!r.ok) return `<div class="verdict-box reject" style="margin-top:8px">${escapeHtml(r.error || 'failed')}</div>`;
+  const bs = r.behavioral_spec;
+  const bsHtml = bs ? `
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      <strong>algorithmic spec:</strong> <code>${escapeHtml(bs.signature)}</code>
+      · input strategy: <code>${escapeHtml(bs.input_strategy)}</code>
+    </div>` : '<div class="muted" style="font-size:12px;margin-top:6px;color:var(--yellow)">⚠ no behavioral_spec — PBT will not run</div>';
+  return `<div class="verdict-box accept" style="margin-top:8px">
+    drafted ${r.drafted_invariants.length} invariants${r.contradictions.length ? ' · ⚠ ' + r.contradictions.length + ' cross-source contradiction(s)' : ''}
+  </div>${bsHtml}`;
+}
+
+// ----- Section 2: editable Lean + verify
+document.getElementById('iter-lean').addEventListener('input', e => {
+  IT_STATE.lean_source = e.target.value;
+});
+
+document.getElementById('iter-lean-check-btn').addEventListener('click', async () => {
+  if (!IT_STATE.lean_source.trim()) { alert('Lean source is empty'); return; }
+  _setStatus('iter-lean-status', 'lake build…', 'running');
+  try {
+    const r = await fetchJSON('/api/verify_lean_text', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: IT_STATE.lean_source}),
+    });
+    IT_STATE.lean_verify = r;
+    _setStatus('iter-lean-status',
+                r.ok ? `✓ type-checks (${r.duration_seconds}s)` : '✗ lake build failed',
+                r.ok ? 'ok' : 'err');
+    document.getElementById('iter-lean-result').innerHTML = r.ok
+      ? `<div class="muted" style="font-size:11px;margin-top:6px">${escapeHtml(r.lean_version || '')}</div>`
+      : `<details open style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">compiler output</summary><pre style="font-size:11px">${escapeHtml(r.stderr || r.stdout)}</pre></details>`;
+  } catch (e) {
+    _setStatus('iter-lean-status', 'error: ' + e.message, 'err');
+  }
+});
+
+// ----- Section 3: editable code + syntax check
+function _itRenderCodeFiles() {
+  const host = document.getElementById('iter-code-files');
+  const paths = Object.keys(IT_STATE.code_repo).sort();
+  if (!paths.length) {
+    host.innerHTML = '<div class="placeholder">Click "Generate code" to populate</div>';
+    return;
+  }
+  host.innerHTML = paths.map((p, i) => `
+    <div style="margin-bottom:10px">
+      <div class="label" style="display:flex;align-items:center;gap:8px">
+        <code>${escapeHtml(p)}</code>
+        <span class="iter-status" id="iter-code-status-${i}"></span>
+      </div>
+      <textarea data-path="${escapeHtml(p)}" style="min-height:180px">${escapeHtml(IT_STATE.code_repo[p])}</textarea>
+    </div>`).join('');
+  host.querySelectorAll('textarea[data-path]').forEach(el => {
+    el.addEventListener('input', () => {
+      IT_STATE.code_repo[el.dataset.path] = el.value;
+    });
+  });
+}
+
+document.getElementById('iter-codegen-btn').addEventListener('click', async () => {
+  if (!IT_STATE.drafted) { alert('run Section 1 (Elicit) first'); return; }
+  _setStatus('iter-code-status', 'generating…', 'running');
+  try {
+    const r = await fetchJSON('/api/codegen_emit', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({spec_json: _itSpecJson()}),
+    });
+    if (!r.ok) {
+      _setStatus('iter-code-status', 'error: ' + (r.error || 'failed'), 'err');
+      return;
+    }
+    IT_STATE.code_repo = r.modified_repo;
+    _itRenderCodeFiles();
+    _setStatus('iter-code-status', `generated ${r.files_changed.length} file(s)`, 'ok');
+    document.getElementById('iter-code-result').innerHTML =
+      r.notes ? `<div class="muted" style="font-size:11px;margin-top:6px">notes: ${escapeHtml(r.notes)}</div>` : '';
+  } catch (e) {
+    _setStatus('iter-code-status', 'error: ' + e.message, 'err');
+  }
+});
+
+document.getElementById('iter-code-check-btn').addEventListener('click', async () => {
+  const files = IT_STATE.code_repo;
+  if (!Object.keys(files).length) { alert('no code to check'); return; }
+  _setStatus('iter-code-status', 'ast.parse…', 'running');
+  try {
+    const r = await fetchJSON('/api/python_syntax_check', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({files}),
+    });
+    IT_STATE.code_syntax = r.results;
+    const bad = r.results.filter(x => !x.ok);
+    _setStatus('iter-code-status',
+                bad.length ? `✗ ${bad.length} file(s) with errors`
+                           : `✓ all ${r.results.length} file(s) parse`,
+                bad.length ? 'err' : 'ok');
+    // Decorate the per-file status pills.
+    const paths = Object.keys(IT_STATE.code_repo).sort();
+    paths.forEach((p, i) => {
+      const res = r.results.find(x => x.path === p);
+      const el = document.getElementById(`iter-code-status-${i}`);
+      if (!el || !res) return;
+      el.className = 'iter-status ' + (res.ok ? 'ok' : 'err');
+      el.textContent = res.ok ? '✓' : `✗ line ${res.line}: ${res.msg}`;
+    });
+    document.getElementById('iter-code-result').innerHTML = bad.length
+      ? `<div class="muted" style="font-size:11px;margin-top:6px;color:var(--red)">${bad.length} file(s) failed; fix and re-check.</div>`
+      : `<div class="muted" style="font-size:11px;margin-top:6px;color:var(--green)">all good.</div>`;
+  } catch (e) {
+    _setStatus('iter-code-status', 'error: ' + e.message, 'err');
+  }
+});
+
+// ----- Section 4: test cases — editable table
+function _itRenderCases() {
+  const host = document.getElementById('iter-cases');
+  if (!IT_STATE.test_cases.length) {
+    host.innerHTML = '<div class="placeholder">Click "Generate cases" to populate</div>';
+    return;
+  }
+  host.innerHTML = `
+    <div class="iter-case-header"><span>input (python literal)</span><span>expected (python literal)</span><span>rationale</span><span></span></div>
+    ${IT_STATE.test_cases.map((c, i) => `
+      <div class="iter-case-row">
+        <textarea data-i="${i}" data-k="input">${escapeHtml(c.input)}</textarea>
+        <textarea data-i="${i}" data-k="expected">${escapeHtml(c.expected)}</textarea>
+        <textarea data-i="${i}" data-k="rationale">${escapeHtml(c.rationale || '')}</textarea>
+        <button class="del" data-i="${i}">×</button>
+      </div>`).join('')}
+  `;
+  host.querySelectorAll('textarea').forEach(el => {
+    el.addEventListener('input', () => {
+      IT_STATE.test_cases[+el.dataset.i][el.dataset.k] = el.value;
+    });
+  });
+  host.querySelectorAll('button.del').forEach(el => {
+    el.addEventListener('click', () => {
+      IT_STATE.test_cases.splice(+el.dataset.i, 1);
+      _itRenderCases();
+    });
+  });
+}
+
+document.getElementById('iter-cases-gen-btn').addEventListener('click', async () => {
+  if (!IT_STATE.drafted) { alert('run Section 1 first'); return; }
+  if (!IT_STATE.behavioral_spec) {
+    alert("this brief has no behavioral_spec; can't generate cases");
+    return;
+  }
+  _setStatus('iter-cases-status', 'generating ~8 cases…', 'running');
+  try {
+    const r = await fetchJSON('/api/generate_test_cases', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({spec_json: _itSpecJson()}),
+    });
+    if (!r.ok) {
+      _setStatus('iter-cases-status', 'error: ' + (r.error || 'failed'), 'err');
+      return;
+    }
+    IT_STATE.test_cases = r.cases;
+    _itRenderCases();
+    _setStatus('iter-cases-status', `${r.cases.length} cases generated`, 'ok');
+  } catch (e) {
+    _setStatus('iter-cases-status', 'error: ' + e.message, 'err');
+  }
+});
+
+document.getElementById('iter-cases-add-btn').addEventListener('click', () => {
+  IT_STATE.test_cases.push({input: '', expected: '', rationale: ''});
+  _itRenderCases();
+});
+
+document.getElementById('iter-cases-run-btn').addEventListener('click', async () => {
+  if (!IT_STATE.test_cases.length) { alert('no cases to run'); return; }
+  if (!Object.keys(IT_STATE.code_repo).length) { alert('no code to run cases against'); return; }
+  const fn = IT_STATE.behavioral_spec && IT_STATE.behavioral_spec.function_name;
+  if (!fn) { alert('no function_name (need behavioral_spec from elicitation)'); return; }
+  _setStatus('iter-cases-status', 'running…', 'running');
+  try {
+    const r = await fetchJSON('/api/run_test_cases', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        files: IT_STATE.code_repo,
+        function_name: fn,
+        cases: IT_STATE.test_cases,
+      }),
+    });
+    IT_STATE.test_results = r.results;
+    const pass = r.results.filter(x => x.status === 'pass').length;
+    const fail = r.results.filter(x => x.status === 'fail').length;
+    const err  = r.results.filter(x => x.status === 'error').length;
+    _setStatus('iter-cases-status',
+                `${pass} ✓ · ${fail} ✗ · ${err} err`,
+                fail || err ? 'err' : 'ok');
+    document.getElementById('iter-cases-result').innerHTML = `
+      <table class="iter-results">
+        <tr><th>#</th><th>input</th><th>expected</th><th>got</th><th>status</th></tr>
+        ${r.results.map((x, i) => `
+          <tr class="${x.status}">
+            <td>${i}</td>
+            <td><code>${escapeHtml(x.input)}</code></td>
+            <td><code>${escapeHtml(x.expected)}</code></td>
+            <td><code>${escapeHtml(x.got || x.error || '')}</code></td>
+            <td>${x.status === 'pass' ? '✓' : x.status === 'fail' ? '✗' : '⊘'}</td>
+          </tr>`).join('')}
+      </table>`;
+  } catch (e) {
+    _setStatus('iter-cases-status', 'error: ' + e.message, 'err');
+  }
+});
+
+// ----- Section 5: PBT
+document.getElementById('iter-pbt-btn').addEventListener('click', async () => {
+  if (!IT_STATE.drafted) { alert('run Section 1 first'); return; }
+  if (!IT_STATE.behavioral_spec) {
+    alert('no behavioral_spec; PBT requires a reference oracle');
+    return;
+  }
+  if (!Object.keys(IT_STATE.code_repo).length) { alert('no code to fuzz'); return; }
+  _setStatus('iter-pbt-status', 'fuzzing with Hypothesis…', 'running');
+  try {
+    const r = await fetchJSON('/api/pbt_only', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        spec_json: _itSpecJson(),
+        generated_repo: IT_STATE.code_repo,
+      }),
+    });
+    IT_STATE.pbt = r;
+    const cls = r.outcome === 'verified' ? 'ok'
+              : r.outcome === 'falsified' ? 'err' : 'err';
+    _setStatus('iter-pbt-status',
+                `${r.outcome} (${r.n_runs || '—'} examples, ${r.duration_seconds}s)`,
+                cls);
+    const ceHtml = r.counterexample
+      ? `<details open style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">counterexample</summary><pre style="font-size:11px">${escapeHtml(r.counterexample)}</pre></details>`
+      : '';
+    const oracle = IT_STATE.behavioral_spec.python_oracle || '';
+    const oracleHtml = oracle ? `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">reference oracle used as the comparator</summary><pre style="font-size:11px">${escapeHtml(oracle)}</pre></details>` : '';
+    document.getElementById('iter-pbt-result').innerHTML = `
+      <div class="verdict-box ${r.outcome === 'verified' ? 'accept' : 'reject'}" style="margin-top:6px">
+        <strong>${r.outcome.toUpperCase()}</strong> — ${escapeHtml(r.detail || '')}
+      </div>
+      ${ceHtml}${oracleHtml}`;
+  } catch (e) {
+    _setStatus('iter-pbt-status', 'error: ' + e.message, 'err');
+  }
+});
+
+// ----- Export bundle (client-side; no endpoint)
+document.getElementById('iter-export-btn').addEventListener('click', () => {
+  const bundle = {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    input: {
+      intent: IT_STATE.intent,
+      brief_id: IT_STATE.brief_id,
+      starting_repo: IT_STATE.starting_repo,
+      ground_truth_spec: IT_STATE.ground_truth_spec,
+      ground_truth_code: IT_STATE.ground_truth_code,
+    },
+    spec: {
+      drafted_invariants: IT_STATE.drafted ? IT_STATE.drafted.drafted_invariants : null,
+      contradictions: IT_STATE.drafted ? IT_STATE.drafted.contradictions : null,
+      behavioral_spec: IT_STATE.behavioral_spec,
+    },
+    lean: {
+      source: IT_STATE.lean_source,
+      verify: IT_STATE.lean_verify,
+    },
+    code: {
+      modified_repo: IT_STATE.code_repo,
+      syntax_check: IT_STATE.code_syntax,
+    },
+    test_cases: {
+      cases: IT_STATE.test_cases,
+      run_results: IT_STATE.test_results,
+    },
+    pbt: IT_STATE.pbt,
+    oracle: IT_STATE.behavioral_spec ? {
+      function_name: IT_STATE.behavioral_spec.function_name,
+      signature: IT_STATE.behavioral_spec.signature,
+      python_oracle: IT_STATE.behavioral_spec.python_oracle,
+      input_strategy: IT_STATE.behavioral_spec.input_strategy,
+      lean_predicate: IT_STATE.behavioral_spec.lean_predicate,
+    } : null,
+  };
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = `vibespec_${IT_STATE.brief_id || 'custom'}_${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+// Initialise the empty file list so the "+ add file" button has something
+// to render against.
+_itRenderFiles();
 </script>
 </body></html>
 """

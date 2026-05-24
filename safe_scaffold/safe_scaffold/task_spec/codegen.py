@@ -257,7 +257,7 @@ def _call_anthropic(
     return text, ""
 
 
-def generate_code(
+def generate_code_only(
     spec: TaskSpec,
     *,
     api_key: str | None = None,
@@ -265,13 +265,14 @@ def generate_code(
     max_tokens: int = 3000,
     timeout_seconds: float = 90.0,
 ) -> CodegenResult:
-    """Ask the LLM to write code that satisfies `spec`, then validate the result.
+    """LLM call + JSON parse + merge into starting_repo. NO validation.
 
-    The verdict in the returned CodegenResult is the structured
-    validator's decision on the generated code. ACCEPT means the LLM
-    produced an implementation that satisfies every invariant *and*
-    passes the positive tests. REJECT means it failed at least one;
-    the verdict carries the per-invariant trace explaining which.
+    Used by the iterative pipeline's "Generate code" button, which
+    intentionally defers validation to the explicit syntax-check /
+    test-cases / PBT buttons so the user is in control of when each
+    check fires. The existing `generate_code` wraps this and runs the
+    structural validator + PBT inline; that variant is what the linear
+    Pipeline tab calls.
     """
     key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
     if not key:
@@ -311,6 +312,40 @@ def generate_code(
     modified_repo = dict(spec.starting_repo)
     modified_repo.update(files_clean)
 
+    return CodegenResult(
+        modified_repo=modified_repo,
+        raw_response=text,
+        notes=str(payload.get("notes", "")),
+    )
+
+
+def generate_code(
+    spec: TaskSpec,
+    *,
+    api_key: str | None = None,
+    model: str = "claude-sonnet-4-5",
+    max_tokens: int = 3000,
+    timeout_seconds: float = 90.0,
+) -> CodegenResult:
+    """Ask the LLM to write code that satisfies `spec`, then validate the result.
+
+    The verdict in the returned CodegenResult is the structured
+    validator's decision on the generated code. ACCEPT means the LLM
+    produced an implementation that satisfies every invariant *and*
+    passes the positive tests. REJECT means it failed at least one;
+    the verdict carries the per-invariant trace explaining which.
+    """
+    emit = generate_code_only(
+        spec,
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+    )
+    if emit.error or not emit.modified_repo:
+        return emit  # propagate the early failure
+
+    modified_repo = emit.modified_repo
     candidate = Candidate(
         candidate_id="llm_generated",
         label=CandidateLabel.CORRECT,  # arbitrary; not used by validator
@@ -340,6 +375,6 @@ def generate_code(
         modified_repo=modified_repo,
         verdict=verdict,
         pbt_result=pbt_result,
-        raw_response=text,
-        notes=str(payload.get("notes", "")),
+        raw_response=emit.raw_response,
+        notes=emit.notes,
     )
