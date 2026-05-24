@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.swp
+
+# Private paper repo cloned alongside this checkout
+Hackathon-Vibe-Coding/

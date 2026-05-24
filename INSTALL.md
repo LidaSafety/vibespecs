@@ -5,8 +5,6 @@ validation work. Below is the minimum sequence of commands to bring
 the demo up, run the rigorous eval, and regenerate `dashboard.html`
 on your own machine.
 
-The full writeup is in
-[`Hackathon-Vibe-Coding/PAPER.md`](Hackathon-Vibe-Coding/PAPER.md);
 [`README.md`](README.md) is the short tour.
 
 ## Requirements
@@ -30,7 +28,6 @@ vibespecs/                       # ← repo root, you start here
 ├── INSTALL.md                   # this file
 ├── dashboard.html               # visual eval output (regenerable)
 ├── key-anthropic.txt            # API key (gitignored in your fork)
-├── Hackathon-Vibe-Coding/       # the paper (LaTeX + markdown twin)
 └── safe_scaffold/               # all code lives here
     ├── demo_server.py           # FastAPI — iterative tab + 4-step tab
     ├── safe_scaffold/           # the Python package
@@ -191,21 +188,19 @@ iterative pipeline's per-button runners.
 
 1. **[`README.md`](README.md)** at the repo root — short tour, headline
    numbers, directory map.
-2. **[`Hackathon-Vibe-Coding/PAPER.md`](Hackathon-Vibe-Coding/PAPER.md)**
-   — the paper writeup (markdown twin of `neurips_2026.tex`).
-3. **`dashboard.html`** at the repo root — visual eval summary: three
+2. **`dashboard.html`** at the repo root — visual eval summary: three
    confusion matrices, rigorous-metrics table, per-invariant ablation,
    per-task drill-down.
-4. **`safe_scaffold/docs/elicitation_and_mutation.md`** — the
+3. **`safe_scaffold/docs/elicitation_and_mutation.md`** — the
    Dodds-aligned writeup of the elicitation + mutation work, with
    method, numbers, and limitations.
-5. **`safe_scaffold/docs/comparison_methodology.md`** — head-to-head
+4. **`safe_scaffold/docs/comparison_methodology.md`** — head-to-head
    vs TiCoder, nl2postcond, Kiro PBT, PRDJudge with the actual
    numbers.
-6. **`safe_scaffold/docs/related_work.md`** — the survey of prior art.
-7. **`safe_scaffold/docs/track1_task_specs.md`** — the original
+5. **`safe_scaffold/docs/related_work.md`** — the survey of prior art.
+6. **`safe_scaffold/docs/track1_task_specs.md`** — the original
    contribution claim writeup (validator + 6-invariant DSL).
-8. **`safe_scaffold/safe_scaffold/task_spec/`** — the implementation;
+7. **`safe_scaffold/safe_scaffold/task_spec/`** — the implementation;
    read order: `spec.py` → `invariants.py` → `validator.py` →
    `baselines.py` → `eval.py` → `metrics.py` → `ablation.py` →
    `elicitation.py` → `lean_emitter.py` → `codegen.py` →

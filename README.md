@@ -4,8 +4,6 @@
 
 Specifications for real systems do not exist as one-shot artifacts: the user's intent emerges as they discover edge cases, rewrite drafts, and react to failing tests. `vibespecs` takes this seriously — every spec artifact (the Lean predicate, the Python reference oracle, the generated code, the LLM-emitted concrete test cases) is independently editable and individually re-verifiable, and the whole session exports as a single JSON **spec bundle**. We back the iterative pipeline with a sibling **batch four-step pipeline** (elicit → Lean → code → validate) that uses the same infrastructure for benchmarking.
 
-The full writeup is in [`Hackathon-Vibe-Coding/PAPER.md`](Hackathon-Vibe-Coding/PAPER.md) (and `neurips_2026.tex` for the formatted version).
-
 ---
 
 ## Quickstart
@@ -178,41 +176,38 @@ vibespecs/
 ├── README.md                              # this file
 ├── INSTALL.md                             # full install + CLI walkthrough
 ├── dashboard.html                         # confusion matrices · rigorous metrics · per-task drill-down
-├── safe_scaffold/                         # ★ THE CODE ★
-│   ├── demo_server.py                     # FastAPI — iterative tab + 4-step tab + compare-drafts tab
-│   ├── safe_scaffold/
-│   │   ├── task_spec/                     # all task-spec modules
-│   │   │   ├── spec.py                    # TaskSpec, Candidate, Verdict (+ ABSTAIN), CandidateLabel,
-│   │   │   │                              #   BehavioralSpec (function_name, lean_predicate, python_oracle)
-│   │   │   ├── invariants.py              # OnlyFilesModified, NoNewImports, DiffSmallerThan,
-│   │   │   │                              #   NoSecretsInDiff, FilesUnchanged, PositiveTestPasses
-│   │   │   ├── validator.py               # StructuredValidator pipeline (3-valued verdicts)
-│   │   │   ├── elicitation.py             # NL → drafted spec; constrained JSON; provenance;
-│   │   │   │                              #   cross-model compare; cross-source contradiction surfacer
-│   │   │   ├── lean_emitter.py            # spec → real Lean 4 source + lake build verify
-│   │   │   ├── ears_emitter.py            # same spec → EARS controlled-NL requirements.md
-│   │   │   ├── codegen.py                 # spec → Python (LLM); generate_code_only is the primitive used
-│   │   │   │                              #   by the iterative tab, generate_code wraps it with validator+PBT
-│   │   │   ├── syntax_check.py            # ast.parse per-file (used by iterative tab §3)
-│   │   │   ├── test_case_gen.py           # LLM-emitted concrete test cases + subprocess runner (§4)
-│   │   │   ├── verify_pbt.py              # Hypothesis-against-oracle PBT runner (§5)
-│   │   │   ├── spec_mutation.py           # mutation harness + per-spec coverage metric
-│   │   │   ├── baselines.py + strong_baselines.py
-│   │   │   │                              # positive_only, llm_judge, nl2postcond, prd_style_judge
-│   │   │   ├── eval.py + metrics.py + ablation.py
-│   │   │   │                              # eval loop, rigorous metrics, per-invariant ablation
-│   │   │   ├── ambiguous_briefs.py        # 3 hand-crafted muddy briefs
-│   │   │   ├── corpus_data/               # 15 toy tasks + 3 multi-file tasks
-│   │   │   └── datasets/                  # MBPP / HumanEval / BCB / HEP / LCB adapters
-│   │   ├── lean_prelude/                  # Diff struct + invariant predicates
-│   │   └── cli.py                         # task-eval, elicit, mutate, emit-lean, dataset-run, ...
-│   ├── tests/                             # stdlib unittest; 219+ passing
-│   ├── docs/                              # writeups; see "Further reading" below
-│   ├── hooks/                             # Claude Code PreToolUse hook (original action-gating Track)
-│   └── examples/                          # demo scripts
-└── Hackathon-Vibe-Coding/                 # the paper (LaTeX + markdown twin)
-    ├── neurips_2026.tex                   # canonical paper (NeurIPS 2026 Evals & Datasets track)
-    └── PAPER.md                           # markdown twin
+└── safe_scaffold/                         # ★ THE CODE ★
+    ├── demo_server.py                     # FastAPI — iterative tab + 4-step tab + compare-drafts tab
+    ├── safe_scaffold/
+    │   ├── task_spec/                     # all task-spec modules
+    │   │   ├── spec.py                    # TaskSpec, Candidate, Verdict (+ ABSTAIN), CandidateLabel,
+    │   │   │                              #   BehavioralSpec (function_name, lean_predicate, python_oracle)
+    │   │   ├── invariants.py              # OnlyFilesModified, NoNewImports, DiffSmallerThan,
+    │   │   │                              #   NoSecretsInDiff, FilesUnchanged, PositiveTestPasses
+    │   │   ├── validator.py               # StructuredValidator pipeline (3-valued verdicts)
+    │   │   ├── elicitation.py             # NL → drafted spec; constrained JSON; provenance;
+    │   │   │                              #   cross-model compare; cross-source contradiction surfacer
+    │   │   ├── lean_emitter.py            # spec → real Lean 4 source + lake build verify
+    │   │   ├── ears_emitter.py            # same spec → EARS controlled-NL requirements.md
+    │   │   ├── codegen.py                 # spec → Python (LLM); generate_code_only is the primitive used
+    │   │   │                              #   by the iterative tab, generate_code wraps it with validator+PBT
+    │   │   ├── syntax_check.py            # ast.parse per-file (used by iterative tab §3)
+    │   │   ├── test_case_gen.py           # LLM-emitted concrete test cases + subprocess runner (§4)
+    │   │   ├── verify_pbt.py              # Hypothesis-against-oracle PBT runner (§5)
+    │   │   ├── spec_mutation.py           # mutation harness + per-spec coverage metric
+    │   │   ├── baselines.py + strong_baselines.py
+    │   │   │                              # positive_only, llm_judge, nl2postcond, prd_style_judge
+    │   │   ├── eval.py + metrics.py + ablation.py
+    │   │   │                              # eval loop, rigorous metrics, per-invariant ablation
+    │   │   ├── ambiguous_briefs.py        # 3 hand-crafted muddy briefs
+    │   │   ├── corpus_data/               # 15 toy tasks + 3 multi-file tasks
+    │   │   └── datasets/                  # MBPP / HumanEval / BCB / HEP / LCB adapters
+    │   ├── lean_prelude/                  # Diff struct + invariant predicates
+    │   └── cli.py                         # task-eval, elicit, mutate, emit-lean, dataset-run, ...
+    ├── tests/                             # stdlib unittest; 219+ passing
+    ├── docs/                              # writeups; see "Further reading" below
+    ├── hooks/                             # Claude Code PreToolUse hook (original action-gating Track)
+    └── examples/                          # demo scripts
 ```
 
 ---
@@ -270,7 +265,6 @@ chmod +x ~/.claude/hooks/pretooluse.sh
 
 ## Further reading in this repo
 
-- **[`Hackathon-Vibe-Coding/PAPER.md`](Hackathon-Vibe-Coding/PAPER.md)** — full paper (markdown twin of `neurips_2026.tex`).
 - **[`safe_scaffold/docs/elicitation_and_mutation.md`](safe_scaffold/docs/elicitation_and_mutation.md)** — Dodds-aligned writeup of the elicitation + mutation work, with method, results, limitations, and a section mapping each Dodds quote to a UI panel.
 - **[`safe_scaffold/docs/comparison_methodology.md`](safe_scaffold/docs/comparison_methodology.md)** — axis-by-axis comparison vs TiCoder, nl2postcond, Kiro, PRDBench.
 - **[`safe_scaffold/docs/related_work.md`](safe_scaffold/docs/related_work.md)** — survey of prior art.
