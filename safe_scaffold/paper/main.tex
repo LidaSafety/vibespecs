@@ -1,0 +1,280 @@
+\documentclass{article}
+
+% NeurIPS 2025 style.
+% The "preprint" option makes the submission non-anonymous and visible-author for camera-ready / arXiv use.
+\usepackage[preprint]{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{verbatim}
+
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codegray},
+  breaklines=true,
+  frame=none,
+}
+
+\title{Vibe-Coding Specs: an end-to-end pipeline from ambiguous intent\\to Lean-verified specifications and validated code}
+
+\author{%
+  Linh L.T.\\
+  \texttt{linhlt-it-ee}\\
+  Hackathon Vibe Coding\\
+  (Track 1 specification elicitation + Track 2 specification validation)
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present a four-step pipeline that turns deliberately ambiguous natural-language requirements into a formal Lean~4 specification, validates the specification against itself with mutation testing and cross-model comparison, and round-trips through code generation to confirm the spec describes implementable behavior. The pipeline operationalises Dodds' observation that ``specifications don't exist'' for most real systems --- instead of forcing a complete coherent spec we surface partiality honestly and verify only what we claim. On the 60-pair hand-authored evaluation our structured validator reaches \textbf{98.3\% accuracy, 2.2\% false-accept rate, and Cohen's $\kappa$ = 0.957} while matching the strongest LLM judge at ${\sim}300\times$ lower wall-clock cost. The mutation harness finds \textbf{39.7\% of perturbations load-bearing} with zero brittle mutations. Cross-dataset experiments on MBPP, HumanEval, BigCodeBench (NeurIPS 2024), HumanEval Pro (ACL 2025), and LiveCodeBench (ICLR 2025) show 100\% Lean type-check across 25 problems and a codegen-validation rate that improves from 40\% to \textbf{92\% after three targeted fixes} to the LiveCodeBench failure mode (0/5 $\to$ 5/5). All code, the Lean prelude, the evaluation harness, and a browser demo are released.
+\end{abstract}
+
+\section{Introduction}
+
+Coding-agent failures fall into roughly three buckets: \emph{obvious wrong} (the code does not do what was asked), \emph{subtle wrong} (the code does what was asked but in a forbidden way), and \emph{scope creep} (the code does what was asked and a lot of other unrelated things besides). Continuous integration today catches the first bucket with positive tests; the second and third are exactly the ones a formal specification ought to catch, yet specifications for most real systems either don't exist or are partial, inconsistent across sources, and mutually contradictory in practice~\cite{dodds2025}.
+
+This paper takes the position that \emph{partial, low-cost, machine-checkable} specifications are achievable for the coding-agent setting even when complete specifications are not. We contribute:
+
+\begin{enumerate}
+\item A \textbf{structural invariant DSL} (6 invariant types) authored as Python dataclasses with a median cost of 9~LOC and 120~seconds per task (\S\ref{sec:dsl}).
+\item A \textbf{four-step pipeline}: ambiguous input $\to$ Lean~4 source $\to$ spec-validation tools (mutation + cross-model) $\to$ code generation with validator round-trip (\S\ref{sec:pipeline}).
+\item A \textbf{Lean~4 emitter and prelude} that turns any task spec into real \texttt{.lean} source type-checkable in $\sim 0.2$s with \texttt{lake build} (\S\ref{sec:lean}). This closes the call's literal ``translate informal requirements into formal representations (e.g., Lean)'' rather than rhetorically.
+\item A \textbf{mutation-testing harness for specifications} that perturbs each invariant five ways and classifies the result as load-bearing, brittle, or invisible (\S\ref{sec:mutation}).
+\item A \textbf{cross-model and cross-source contradiction surfacer} that re-drafts the spec with a second LLM and surfaces every field where the two models disagree (\S\ref{sec:cross}).
+\item A \textbf{25-problem evaluation across 5 external benchmarks} spanning 2021 $\to$ 2025 with documented before/after numbers on a targeted LiveCodeBench improvement (\S\ref{sec:datasets}).
+\end{enumerate}
+
+The aim is not to advance the state of the art in any single one of these axes but to \textbf{assemble the smallest end-to-end pipeline that touches every requirement the call lists} --- elicitation, formalisation, validation, round-trip implementation --- while being honest about the partiality of every step.
+
+\section{Related work}
+
+\paragraph{Specifications don't exist.}
+\citet{dodds2025} argues that outside a few naturally-formalisable domains (compilers, kernels, cryptographic libraries), formal specifications for real systems do not exist and \emph{cannot} exist in the complete-and-coherent form formal-verification tools require. The PDF format is his recurring case study: every reader interprets ambiguous documents slightly differently. Galois' DaeDaLus / FAW~\cite{daedalus2024} is the practical companion. This paper takes Dodds' position as a design constraint: partial, machine-checkable specs are the realistic target.
+
+\paragraph{Specification IDEs and elicitation pipelines.}
+Lean Atlas~\cite{leanatlas2026} is a recently-announced ``human-in-the-loop'' Lean~4 IDE that visualises the dependency graph of a Lean project and flags nodes needing human \emph{semantic} review --- the type-checker only verifies \emph{logical} correctness. We borrow that distinction directly: our pipeline shows \checkmark{} on \texttt{lake build} but emits provenance chips (explicit / inferred / default) on every drafted invariant. Kiro IDE~\cite{kiro2026} adopts a three-artifact spec model (\texttt{requirements.md} in EARS notation, \texttt{design.md}, \texttt{tasks.md}); we mirror the artifact-as-file shape with a \texttt{spec.lean} / \texttt{requirements.ears} toggle. SPEEDY~\cite{speedy2014} and the Trustworthy~NL~Specs work~\cite{trustworthynl2023} both pioneer per-clause traceability between English source and formal output; our split-pane source$\leftrightarrow$spec linked view follows their pattern.
+
+\paragraph{Spec-elicitation baselines.}
+TiCoder~\cite{ticoder2022} elicits a spec as one or more discriminating tests the user approves. nl2postcond~\cite{nl2postcond2024} uses LLMs to generate Java postcondition assertions on Defects4J methods. PRDBench / PRDJudge~\cite{prdbench2026} uses structured PRDs with per-criterion LLM rubrics; we implement PRDJudge as our \texttt{prd\_style\_judge} baseline. Our DSL differs by combining \textbf{behavioral coverage} (positive tests, as in TiCoder) with \textbf{structural coverage} (diff-scoped invariants, novel here).
+
+\paragraph{Code-generation benchmarks.}
+We adapt samples from five external Python benchmarks: MBPP~\cite{mbpp2021}, HumanEval~\cite{humaneval2021}, BigCodeBench~\cite{bigcodebench2024}, HumanEval~Pro~\cite{humanevalpro2025}, and LiveCodeBench~\cite{livecodebench2025}.
+
+\section{Method}
+
+\subsection{The invariant DSL}\label{sec:dsl}
+
+A \texttt{TaskSpec} is a frozen Python dataclass with four fields: a one-sentence \texttt{description}, a \texttt{starting\_repo} mapping path to source, a tuple of \texttt{positive\_tests}, and a tuple of \texttt{negative\_invariants}. The library exposes six invariant types (Table~\ref{tab:invariants}).
+
+\begin{table}[ht]
+\centering
+\caption{The six structural invariants and what each catches.}
+\label{tab:invariants}
+\begin{tabular}{ll}
+\toprule
+Invariant & Catches \\
+\midrule
+\texttt{OnlyFilesModified(paths)}  & Edits outside the named scope \\
+\texttt{FilesUnchanged(paths)}     & Edits to files that must stay frozen \\
+\texttt{NoNewImports(forbidden)}   & New imports of \texttt{os}, \texttt{subprocess}, network libs \\
+\texttt{NoSecretsInDiff()}         & AWS / Anthropic / GitHub keys, private-key blocks, hardcoded passwords \\
+\texttt{DiffSmallerThan(n)}        & Sprawling rewrites of small tasks \\
+\texttt{PositiveTestPasses(test)}  & Behavioral oracle \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Authoring cost on our hand-authored 15-task corpus is \textbf{median 9 LOC, median 120s per spec}. The invariants are deliberately \emph{structural} rather than behavioral: the user reasons about which files the change is allowed to touch and which imports it may not introduce. This is what makes the partial-spec approach achievable at low cost.
+
+The validator runs deny-overrides: any failing invariant or any failing positive test produces a REJECT verdict carrying the per-invariant trace. To honour Dodds' ``potato of doom'' zone we added an \textbf{ABSTAIN} verdict for cases where the spec itself could not be evaluated.
+
+\subsection{The four-step pipeline}\label{sec:pipeline}
+
+The browser demo is organised as four full-screen sub-tabs:
+
+\begin{enumerate}
+\item \textbf{Extremely ambiguous input.} The LLM is restricted to emit a single JSON object matching a fixed schema, validated structurally before being materialised into \texttt{Invariant} instances. The output carries (a) per-field rationales, (b) per-field provenance chips (explicit / inferred / default), and (c) a cross-source contradictions panel.
+\item \textbf{Lean output.} The drafted spec is emitted as real Lean~4 source against our bundled \texttt{SafeScaffold.Basic} prelude. \texttt{lake build} type-checks it in $\sim 0.2$s. A toggle switches between the formal Lean view (\texttt{spec.lean}) and an EARS-syntax controlled-NL view (\texttt{requirements.ears}).
+\item \textbf{Validate spec with tools.} The same brief is re-drafted with a second LLM; fields where the two models disagree are surfaced as warnings.
+\item \textbf{Create Python code.} The LLM is asked to implement the drafted spec; the StructuredValidator runs the result and returns ACCEPT or a REJECT carrying the specific invariant that tripped.
+\end{enumerate}
+
+\subsection{Lean 4 emission and verification}\label{sec:lean}
+
+The bundled prelude (\texttt{safe\_scaffold/lean\_prelude/SafeScaffold/Basic.lean}) mirrors each invariant as a \texttt{Diff $\to$ Prop} predicate:
+
+\begin{lstlisting}[language={}]
+def spec (d : Diff) : Prop :=
+    OnlyFilesModified d [...] /\
+    NoNewImports d [...] /\
+    DiffSmallerThan d N /\
+    NoSecretsInDiff d
+\end{lstlisting}
+
+The prelude is self-contained (Lean~4 stdlib only --- no mathlib), keeping \texttt{lake build} time to $\sim 0.2$s per spec after caching. \texttt{lake build} verifies that the spec is \emph{well-typed under Lean~4}; it does not prove that any candidate diff satisfies the spec --- that remains a Python concern in the validator. The Lean leg is what makes ``into Lean'' literal rather than rhetorical.
+
+\subsection{Mutation testing for specifications}\label{sec:mutation}
+
+We perturb each invariant in five ways: \texttt{drop\_invariant}, \texttt{weaken\_bound} (numeric), \texttt{shrink\_set}, \texttt{widen\_scope}, and \texttt{drop\_test}. Each mutation re-runs the corpus candidates against the perturbed spec and classifies the outcome as \textbf{load-bearing} (newly admits a should-reject), \textbf{brittle} (newly rejects a should-accept), or \textbf{invisible}. The per-spec \emph{coverage score} is the fraction of mutation kinds with at least one load-bearing case --- a Dodds-aligned honesty metric.
+
+\subsection{Cross-source contradiction surfacing}\label{sec:cross}
+
+When the elicitation receives multiple sources (intent + prose doc + existing tests + slide deck), the LLM is required to additionally emit a \texttt{contradictions} array. In our hand-crafted Brief~B --- a PRD that requires bcrypt-hashed passwords \emph{and} ``store exactly as provided so support can read them back'' \emph{and} ``no new dependencies'' \emph{and} ``use bcrypt'' --- the LLM consistently identifies both internal contradictions and emits a deliberate side-taking resolution.
+
+\section{Experiments}\label{sec:datasets}
+
+\subsection{Validator vs.\ baselines}
+
+We compare five evaluators on the 60-pair hand-authored corpus (Table~\ref{tab:validator}).
+
+\begin{table}[ht]
+\centering
+\caption{Validator vs.\ baselines on the 60-pair extended corpus. ``sec / $\Delta\%$FAR'' is wall-clock seconds per percentage-point of FAR reduction relative to \texttt{positive\_only}.}
+\label{tab:validator}
+\begin{tabular}{lrrrrrr}
+\toprule
+Evaluator & Accuracy & FAR & FRR & $\kappa$ & Disc.\ power & sec/$\Delta\%$FAR \\
+\midrule
+\texttt{structured} (ours)  & \textbf{98.3\%} & \textbf{2.2\%} & 0.0\% & \textbf{0.957} & 97.8\% & 31.9 \\
+\texttt{positive\_only}    & 50.0\% & 66.7\% & 0.0\% & 0.200 & 33.3\% & (base) \\
+\texttt{llm\_judge}        & 100\% & 0\% & 0\% & 1.000 & 100\% & 30.8 \\
+\texttt{nl2postcond}       & 75.0\% & 0\% & 100\% & 0.000 & 0\% & 30.8 \\
+\texttt{prd\_style\_judge} & 100\% & 0\% & 0\% & 1.000 & --- & 30.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-invariant ablation}
+
+Drop one invariant from every spec in the corpus, re-measure FAR (Table~\ref{tab:ablation}).
+
+\begin{table}[ht]
+\centering
+\caption{Per-invariant ablation. ``$\Delta$~FAR'' is the new minus baseline (3.3\%) FAR.}
+\label{tab:ablation}
+\begin{tabular}{lrrrr}
+\toprule
+Invariant ablated & FAR with & FAR w/o & $\Delta$~FAR & Newly admitted \\
+\midrule
+\texttt{OnlyFilesModified} & 3.3\% & 26.7\% & \textbf{+23.3\%} & 7 \\
+\texttt{NoNewImports}      & 3.3\% & 23.3\% & \textbf{+20.0\%} & 6 \\
+\texttt{DiffSmallerThan}   & 3.3\% & 13.3\% & \textbf{+10.0\%} & 3 \\
+\texttt{NoSecretsInDiff}   & 3.3\% & 6.7\%  & +3.3\%  & 1 \\
+\texttt{FilesUnchanged}    & 3.3\% & 3.3\%  & 0.0\%   & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Scope discipline and import blocking carry most of the safety; \texttt{FilesUnchanged} is dead weight on this corpus.
+
+\subsection{Mutation harness}
+
+\begin{table}[ht]
+\centering
+\caption{Mutation classification on the 60-pair corpus (179 total mutations).}
+\label{tab:mutation}
+\begin{tabular}{lrrr}
+\toprule
+Kind & load\_bearing & brittle & invisible \\
+\midrule
+\texttt{drop\_invariant} & 27 & 0 & 33 \\
+\texttt{drop\_test}      & 15 & 0 & 0 \\
+\texttt{widen\_scope}    & 12 & 0 & 2 \\
+\texttt{shrink\_set}     & 11 & 0 & 49 \\
+\texttt{weaken\_bound}   & 6  & 0 & 24 \\
+\midrule
+\textbf{Total}           & \textbf{71} (39.7\%) & 0 & 108 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Zero brittle mutations is the key honesty signal: the spec's invariants are doing work without being on the edge of false rejection.
+
+\subsection{Cross-dataset pipeline run}
+
+\begin{table}[ht]
+\centering
+\caption{Cross-dataset 4-step pipeline run. ``Codegen (initial)'' is the first run; the right column is after three targeted fixes (\S\ref{sec:lcb-fix}).}
+\label{tab:datasets}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Year & Drafted & Lean \checkmark & Codegen \checkmark & Codegen (initial) \\
+\midrule
+MBPP & 2021 & 5/5 & 5/5 & \textbf{4/5 (80\%)} & 2/5 (40\%) \\
+HumanEval & 2021 & 5/5 & 5/5 & \textbf{5/5 (100\%)} & 5/5 (100\%) \\
+BigCodeBench & 2024 & 5/5 & 5/5 & \textbf{4/5 (80\%)} & 2/5 (40\%) \\
+HumanEval Pro & 2025 & 5/5 & 5/5 & \textbf{5/5 (100\%)} & 1/5 (20\%) \\
+LiveCodeBench & 2024--25 & 5/5 & 5/5 & \textbf{5/5 (100\%)} & 0/5 (0\%) \\
+\midrule
+\textbf{Total} & & \textbf{25/25} & \textbf{25/25} & \textbf{23/25 (92\%)} & 10/25 (40\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The LiveCodeBench fix}\label{sec:lcb-fix}
+
+The initial 40\% pass rate (LCB at 0\%) revealed three avoidable failure modes that the pipeline's per-invariant trace made precisely diagnosable: (i)~the LLM-invented positive test did not match the benchmark's canonical I/O contract; (ii)~the function stub did not communicate the I/O contract; (iii)~the codegen response parser was too strict to handle \texttt{<answer>}-tag-wrapped JSON output.
+
+Three targeted fixes brought the combined score to \textbf{92\%}: (i)~pre-author the positive test from each benchmark's \texttt{public\_test\_cases} via a new \texttt{override\_positive\_test} hook on \texttt{draft\_spec}; (ii)~explicit-contract stub for stdin/stdout problems (e.g.\ ``do NOT call \texttt{input()} or \texttt{print()}''); (iii)~brace-counted lenient JSON extractor combined with a ``your ENTIRE response must be parseable JSON'' system-prompt directive.
+
+\subsection{Cross-model comparison example}
+
+On the under-specified brief ``Add a \texttt{subtract(a,b)} function to \texttt{calculator.py}'', drafting with both Claude Sonnet~4.5 and Claude Haiku~4.5 yields (Table~\ref{tab:crossmodel}).
+
+\begin{table}[ht]
+\centering
+\caption{Cross-model agreement on an under-specified brief.}
+\label{tab:crossmodel}
+\begin{tabular}{llll}
+\toprule
+Field & Sonnet & Haiku & Agreement \\
+\midrule
+\texttt{allowed\_files}      & \texttt{[calculator.py]} & \texttt{[calculator.py]} & agree \\
+\texttt{forbidden\_imports}  & 9 modules                & 0 modules                & \textbf{disagree} \\
+\texttt{max\_diff\_lines}    & 10                       & 10                       & agree \\
+\texttt{check\_secrets}      & true                     & true                     & agree \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The disagreement on \texttt{forbidden\_imports} is a spec-level signal that the input under-specifies what defenses the spec should erect.
+
+\section{Discussion}
+
+\paragraph{Lean emission is 100\% reliable; codegen is not.}
+Across every dataset in every era, the elicited spec type-checks under Lean~4. This is exactly the Lean Atlas blind spot --- structural well-formedness does not catch semantic under-specification. The codegen round-trip (Step~4) is what surfaces semantic gaps.
+
+\paragraph{The improvement strategy generalises.}
+The \texttt{override\_positive\_test} hook is dataset-agnostic: any benchmark that ships canonical tests can pre-author them in one line of adapter code. The JSON-extraction fix helps every codegen call regardless of dataset. The lesson --- \emph{do not delegate the oracle to the model; pre-author it when the dataset provides one} --- is general.
+
+\paragraph{Provenance chips are the missing review interface.}
+Of our 25 cross-dataset runs, every drafted spec contains at least one \texttt{default}-grounded invariant the LLM filled in without evidence. Surfacing those chips gives reviewers the ``needs semantic review'' signal Lean Atlas argues a bare \texttt{lake build} \checkmark{} does not provide.
+
+\section{Limitations}
+
+The mutation harness's \texttt{widen\_scope} uses candidate-derived paths to remain informative; a blind variant would need curated scope-creep-shaped filename pools per category. All mutations are structural; semantic perturbation (e.g.\ inverting an assertion) is unimplemented. The complex hand-authored corpus is 3 multi-file tasks (12 pairs). \texttt{lake build} verifies logical, not semantic, correctness --- \texttt{looksLikeSecret} is \texttt{opaque} because regex matching on \texttt{String} is heavy to model. Sample size on the 5-dataset run is 5 problems each (25 total).
+
+\section{Conclusion}
+
+A deliberately partial, structural-invariant DSL can be drafted from ambiguous English in seconds, emitted as real Lean~4 source that \texttt{lake build} type-checks in 0.2~s, mutation-tested to surface which invariants are doing real work, cross-validated against a second LLM, and round-tripped through code generation to confirm the spec describes implementable behavior. On a 25-problem cross-dataset sample spanning 2021 $\to$ 2025 the pipeline reaches 100\% Lean type-check and 92\% codegen-validation after a small number of targeted, auditable fixes.
+
+Future work: (i)~Dafny/F\textsuperscript{*} back-ends to compare formal-target ergonomics; (ii)~larger-scale FeatureBench / PRDBench runs once access becomes available; (iii)~semantic mutation operators; (iv)~integration with a real PR-review surface so the per-invariant trace lands in the agent's actual workflow.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,5 @@
+{"log":
+ [{"message":
+   ".> LEAN_PATH=././.lake/build/lib LD_LIBRARY_PATH= /home/linh/.elan/toolchains/leanprover--lean4---v4.10.0/bin/lean ././././SafeScaffold.lean -R ./././. -o ././.lake/build/lib/SafeScaffold.olean -i ././.lake/build/lib/SafeScaffold.ilean -c ././.lake/build/ir/SafeScaffold.c --json",
+   "level": "trace"}],
+ "depHash": "10428218282010568356"}

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-scaffold"
+version = "0.2.0"
+description = "Formal action gating + spec validation for AI coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Lida Safety Research" },
+]
+keywords = ["ai-safety", "formal-methods", "coding-agents", "specification"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+]
+
+# CORE HAS ZERO REQUIRED DEPS. Everything works on stdlib.
+# Optional deps unlock additional capabilities.
+dependencies = []
+
+[project.optional-dependencies]
+# Enables policy-level invariant proofs (Z3-backed verifier).
+# Without it, the direct evaluator still gates individual actions.
+smt = ["z3-solver>=4.12"]
+
+# Enables live NL -> DSL translation through Anthropic's API.
+# Without it, the StubTranslator with curated exemplars still works.
+llm = ["anthropic>=0.40"]
+
+# Track 2 cross-checking against running servers.
+# The toy fixtures (e.g. the Cryspen ML-KEM reproduction) don't need this.
+cross-check = ["requests>=2.31"]
+
+# Dev tooling. Tests themselves run under stdlib unittest.
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+all = [
+    "safe-scaffold[smt,llm,cross-check]",
+]
+
+[project.urls]
+Homepage = "https://github.com/lida-safety/safe-scaffold"
+Documentation = "https://github.com/lida-safety/safe-scaffold/tree/main/docs"
+
+[project.scripts]
+safe-scaffold = "safe_scaffold.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["safe_scaffold*"]
+exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+safe_scaffold = ["py.typed", "policies/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]
+ignore = ["E501"]  # we let the formatter handle line length
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_configs = true
